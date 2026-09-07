@@ -1,4 +1,4 @@
-# ps1-tim-tool
+# PS1 TIM Tool
 
 A command-line converter between standard image formats and Sony's official **TIM** texture format for the original PlayStation (PS1).
 
