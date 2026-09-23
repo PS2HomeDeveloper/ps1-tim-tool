@@ -92,8 +92,39 @@ jobs:
       - name: Build (${{ matrix.target }})
         run: |
           mkdir -p dist
+          cat > /tmp/win_compat_prelude.h <<'PRELUDE_EOF'
+          #include <sys/stat.h>
+          #include <sys/types.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #define mkdir(path, mode) mkdir(path)
+          static ssize_t ps1_getline(char **lineptr, size_t *n, FILE *stream) {
+              if (*lineptr == NULL || *n == 0) {
+                  *n = 128;
+                  *lineptr = (char *)malloc(*n);
+                  if (*lineptr == NULL) return -1;
+              }
+              size_t pos = 0;
+              int c;
+              while ((c = fgetc(stream)) != EOF) {
+                  if (pos + 1 >= *n) {
+                      size_t new_size = (*n) * 2;
+                      char *new_ptr = (char *)realloc(*lineptr, new_size);
+                      if (!new_ptr) return -1;
+                      *n = new_size;
+                      *lineptr = new_ptr;
+                  }
+                  (*lineptr)[pos++] = (char)c;
+                  if (c == '\n') break;
+              }
+              if (pos == 0 && c == EOF) return -1;
+              (*lineptr)[pos] = '\0';
+              return (ssize_t)pos;
+          }
+          #define getline ps1_getline
+          PRELUDE_EOF
           ${{ matrix.compiler }} -O3 -std=gnu11 -Wall -Wextra \
-            -D_GNU_SOURCE -D'mkdir(p,m)=mkdir(p)' \
+            -include /tmp/win_compat_prelude.h \
             "$SRC_PATH" \
             -lpng -ljpeg -lgif -ltiff -lwebp -lz -lm \
             -o "dist/ps1_tim_tool_${{ matrix.target }}.exe"
