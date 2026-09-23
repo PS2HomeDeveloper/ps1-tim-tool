@@ -55,14 +55,17 @@ jobs:
             runner: windows-latest
             msystem: MINGW64
             pkg_prefix: mingw-w64-x86_64
+            compiler: gcc
           - target: windows_x86
             runner: windows-latest
             msystem: MINGW32
             pkg_prefix: mingw-w64-i686
+            compiler: gcc
           - target: windows_arm64
             runner: windows-11-arm
             msystem: CLANGARM64
             pkg_prefix: mingw-w64-clang-aarch64
+            compiler: clang
 
     runs-on: ${{ matrix.runner }}
     defaults:
@@ -89,7 +92,8 @@ jobs:
       - name: Build (${{ matrix.target }})
         run: |
           mkdir -p dist
-          gcc -O3 -std=c11 -Wall -Wextra \
+          ${{ matrix.compiler }} -O3 -std=gnu11 -Wall -Wextra \
+            -D_GNU_SOURCE -D'mkdir(p,m)=mkdir(p)' \
             "$SRC_PATH" \
             -lpng -ljpeg -lgif -ltiff -lwebp -lz -lm \
             -o "dist/ps1_tim_tool_${{ matrix.target }}.exe"
@@ -158,20 +162,11 @@ jobs:
 
 
   # ─────────────────────────────────────────────
-  # macOS (arm64 / x86_64) — مكتبات جاهزة رسميًا عبر Homebrew
+  # macOS arm64 — مكتبات جاهزة رسميًا عبر Homebrew (تشغيل أصلي)
   # ─────────────────────────────────────────────
-  build-macos:
+  build-macos-arm64:
     needs: cleanup
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: macos_arm64
-            runner: macos-14
-          - target: macos_x86_64
-            runner: macos-13
-
-    runs-on: ${{ matrix.runner }}
+    runs-on: macos-14
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -180,7 +175,7 @@ jobs:
         run: |
           brew install libpng jpeg giflib libtiff webp
 
-      - name: Build (${{ matrix.target }})
+      - name: Build (macos_arm64)
         run: |
           mkdir -p dist
           BREW_PREFIX=$(brew --prefix)
@@ -188,13 +183,55 @@ jobs:
             -I"$BREW_PREFIX/include" -L"$BREW_PREFIX/lib" \
             "$SRC_PATH" \
             -lpng -ljpeg -lgif -ltiff -lwebp -lz -lm \
-            -o "dist/ps1_tim_tool_${{ matrix.target }}"
+            -o "dist/ps1_tim_tool_macos_arm64"
 
       - name: Upload to v1.0.0 release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload v1.0.0 "dist/ps1_tim_tool_${{ matrix.target }}" --repo "$GITHUB_REPOSITORY" --clobber
+          gh release upload v1.0.0 "dist/ps1_tim_tool_macos_arm64" --repo "$GITHUB_REPOSITORY" --clobber
+
+
+
+  # ─────────────────────────────────────────────
+  # macOS x86_64 — بدون انتظار جهاز Intel حقيقي (نادر جدًا في GitHub الآن):
+  # cross-compile على نفس جهاز arm64 عبر vcpkg (مكتبات تُبنى من المصدر لهدف x64-osx)
+  # ─────────────────────────────────────────────
+  build-macos-x86_64:
+    needs: cleanup
+    runs-on: macos-14
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Bootstrap vcpkg
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git
+          ./vcpkg/bootstrap-vcpkg.sh
+
+      - name: Build dependencies from source (x64-osx)
+        run: |
+          ./vcpkg/vcpkg install libpng libjpeg-turbo giflib tiff libwebp --triplet=x64-osx
+
+      - name: List installed libraries (تشخيص)
+        run: |
+          ls -la vcpkg/installed/x64-osx/lib || true
+
+      - name: Build (macos_x86_64)
+        run: |
+          mkdir -p dist
+          VCPKG_DIR="vcpkg/installed/x64-osx"
+          clang -O3 -std=c11 -Wall -Wextra -arch x86_64 \
+            -I"$VCPKG_DIR/include" -L"$VCPKG_DIR/lib" \
+            "$SRC_PATH" \
+            -lpng16 -ljpeg -lgif -ltiff -llzma -lwebp -lsharpyuv -lz -lm \
+            -o "dist/ps1_tim_tool_macos_x86_64"
+
+      - name: Upload to v1.0.0 release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload v1.0.0 "dist/ps1_tim_tool_macos_x86_64" --repo "$GITHUB_REPOSITORY" --clobber
 
 
 
@@ -222,7 +259,7 @@ jobs:
             ndk_target: x86_64-linux-android
 
     env:
-      NDK_API: 21
+      NDK_API: 24
 
     steps:
       - name: Checkout repository
@@ -245,6 +282,10 @@ jobs:
         run: |
           ./vcpkg/vcpkg install libpng libjpeg-turbo giflib tiff libwebp --triplet=${{ matrix.triplet }}
 
+      - name: List installed libraries (تشخيص)
+        run: |
+          ls -la vcpkg/installed/${{ matrix.triplet }}/lib || true
+
       - name: Build (android-${{ matrix.arch }})
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
@@ -255,7 +296,10 @@ jobs:
           "$CLANG" -O3 -std=c11 -Wall -Wextra \
             -I"$VCPKG_DIR/include" -L"$VCPKG_DIR/lib" \
             "$SRC_PATH" \
-            -lpng16 -ljpeg -lgif -ltiff -lwebp -lz -lm -static-libgcc \
+            -Wl,--start-group \
+            -lpng16 -ljpeg -lgif -ltiff -llzma -lwebp -lsharpyuv -lz -lm \
+            -Wl,--end-group \
+            -static-libgcc \
             -o "dist/ps1_tim_tool_android_${{ matrix.arch }}"
 
       - name: Upload to v1.0.0 release
@@ -300,6 +344,10 @@ jobs:
         run: |
           ./vcpkg/vcpkg install libpng libjpeg-turbo giflib tiff libwebp --triplet=${{ matrix.triplet }}
 
+      - name: List installed libraries (تشخيص)
+        run: |
+          ls -la vcpkg/installed/${{ matrix.triplet }}/lib || true
+
       - name: Build (ios-${{ matrix.arch }})
         run: |
           mkdir -p dist
@@ -309,7 +357,7 @@ jobs:
             -arch ${{ matrix.clang_arch }} -isysroot "$SDK_PATH" ${{ matrix.min_version_flag }} \
             -I"$VCPKG_DIR/include" -L"$VCPKG_DIR/lib" \
             "$SRC_PATH" \
-            -lpng16 -ljpeg -lgif -ltiff -lwebp -lz -lm \
+            -lpng16 -ljpeg -lgif -ltiff -llzma -lwebp -lsharpyuv -lz -lm \
             -o "dist/ps1_tim_tool_ios_${{ matrix.arch }}"
 
       - name: Upload to v1.0.0 release
