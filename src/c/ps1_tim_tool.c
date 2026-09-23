@@ -2346,10 +2346,12 @@ static void diff_folders(const char *a, const char *b) {
 /* CONVERSION DRIVER AND COMPLETE COMMAND-LINE INTERFACE                      */
 /* ========================================================================== */
 
+#define PS1_TOOL_VERSION "1.0.0"
+
 typedef struct {
     StrVec images, original, modified;
     const char *format, *output, *output_dir, *resize, *extract, *diff_list, *list;
-    bool dither, no_premult, info, verify, diff, list_formats, help;
+    bool dither, no_premult, info, verify, diff, list_formats, help, version;
     int vram_x, vram_y, clut_x, clut_y, palette_count, palette_index;
 } Options;
 
@@ -2383,6 +2385,7 @@ static void usage(FILE *f, const char *prog) {
             "  --diff-list FILE      whitespace-separated original/modified pairs\n"
             "  --list FILE           batch list: <filename> <format> per line\n"
             "  --list-formats        show formats and commands\n"
+            "  --version             show version\n"
             "  -h, --help            show this help\n",
             prog, prog, prog, prog);
 }
@@ -2436,6 +2439,10 @@ static bool parse_options(int argc, char **argv, Options *o) {
             mode = NORMAL;
             if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
                 o->help = true;
+                continue;
+            }
+            if (!strcmp(a, "--version")) {
+                o->version = true;
                 continue;
             }
             if (!strcmp(a, "--dither")) {
@@ -2710,6 +2717,10 @@ int main(int argc, char **argv) {
     int rc = 0;
     if (o.help) {
         usage(stdout, argv[0]);
+        goto done;
+    }
+    if (o.version) {
+        printf("ps1_tim_tool %s\n", PS1_TOOL_VERSION);
         goto done;
     }
     if (o.diff) {
