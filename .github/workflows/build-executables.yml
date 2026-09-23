@@ -386,9 +386,9 @@ jobs:
           VCPKG_DIR="vcpkg/installed/${{ matrix.triplet }}"
           clang -O3 -std=c11 -Wall -Wextra \
             -arch ${{ matrix.clang_arch }} -isysroot "$SDK_PATH" ${{ matrix.min_version_flag }} \
-            -I"$VCPKG_DIR/include" -L"$VCPKG_DIR/lib" \
+            -I"$VCPKG_DIR/include" -L"$VCPKG_DIR/lib" -F"$VCPKG_DIR/lib" \
             "$SRC_PATH" \
-            -lpng16 -ljpeg -lgif -ltiff -llzma -lwebp -lsharpyuv -lz -lm \
+            -lpng16 -ljpeg -lgif -framework tiff -llzma -lwebp -lsharpyuv -lz -lm \
             -o "dist/ps1_tim_tool_ios_${{ matrix.arch }}"
 
       - name: Upload to v1.0.0 release
