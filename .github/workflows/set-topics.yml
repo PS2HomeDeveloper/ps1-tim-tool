@@ -1,0 +1,34 @@
+name: Set Topics
+
+on:
+  workflow_dispatch:
+
+jobs:
+  set-topics:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set repository topics
+        env:
+          GH_TOKEN: ${{ secrets.TOPICS_TOKEN }}
+        run: |
+          gh api -X PUT "repos/$GITHUB_REPOSITORY/topics" \
+            -H "Accept: application/vnd.github+json" \
+            -f 'names[]=cli-tool' \
+            -f 'names[]=game-modding' \
+            -f 'names[]=homebrew' \
+            -f 'names[]=image-conversion' \
+            -f 'names[]=playstation' \
+            -f 'names[]=ps1' \
+            -f 'names[]=ps1-homebrew' \
+            -f 'names[]=psx' \
+            -f 'names[]=python' \
+            -f 'names[]=texture-converter' \
+            -f 'names[]=tim' \
+            -f 'names[]=c'
+
+      - name: Set repository description
+        env:
+          GH_TOKEN: ${{ secrets.TOPICS_TOKEN }}
+        run: |
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY" \
+            -f description="Command-line converter between images and PlayStation 1 TIM textures. Supports 4/8/16/24-bit formats, VRAM/CLUT placement, extraction, verification, diffing, and batch conversion. Available in C and Python."
