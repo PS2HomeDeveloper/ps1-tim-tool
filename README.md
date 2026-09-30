@@ -33,7 +33,9 @@ Most PS1 texture tools are either GUI-only, Windows-only, or long abandoned. Thi
 
 ### Option 1: Prebuilt binaries (no Python required)
 
-Prebuilt executables built from the C version are published on the [Releases](https://github.com/PS2HomeDeveloper/ps1-tim-tool/releases) page. Download the file for your platform and run it directly, no installation and no dependencies.
+> **Need speed? Use the executable.** The Python version is much slower than the native C build, and the gap grows with the number of files. If you convert large textures or process many files at once, download the executable for your device from the [Releases page](https://github.com/PS2HomeDeveloper/ps1-tim-tool/releases) instead of running the Python script.
+
+Prebuilt executables built from the C version are published on the [Releases](https://github.com/PS2HomeDeveloper/ps1-tim-tool/releases) page. Download the file for your platform and run it directly. They are only a few hundred kilobytes because they use the image libraries installed on your system (`libpng`, `libjpeg`, `giflib`, `libtiff`, `libwebp`, `zlib`). If the executable reports a missing library, install those packages with your package manager, or use the Python version.
 
 | Platform | Architectures | File name pattern |
 |---|---|---|
