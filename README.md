@@ -1,5 +1,7 @@
 # PS1 TIM Tool
 
+⭐ If this tool saved you time, consider starring the repo. It helps others find it too.
+
 A command-line converter between standard image formats and Sony's official **TIM** texture format for the original PlayStation (PS1).
 
 Convert PNG/JPG/BMP/TGA/WebP and more into `.tim`, inspect and validate existing `.tim` files, extract textures back out to images, and diff two `.tim` files to check whether a modified texture is safe to inject back into a game.
@@ -12,6 +14,10 @@ The tool is available in **two implementations with the same command-line interf
 | **Python** | [`src/py/ps1_tim_tool.py`](src/py/ps1_tim_tool.py) | Easy to read, modify and run anywhere Python + Pillow are available |
 
 Built directly from the documented TIM header layout: no game-specific hacks, no dependency on any emulator or SDK.
+
+![TIM to PNG conversion with transparency](assets/01_convert_tim_to_png.png)
+
+*Every screenshot in this README is real output of the tool, run on textures extracted from a real PS1 game.*
 
 ## Why this exists
 
@@ -103,6 +109,12 @@ python3 src/py/ps1_tim_tool.py texture.tim --extract png
 python3 src/py/ps1_tim_tool.py --diff --original original.tim --modified edited.tim
 ```
 
+## Converting images
+
+Reducing a photo to 16 colors (4-bit) is where dithering matters. Without it the sky collapses into flat bands; with `--dither` the palette is spread across neighboring pixels.
+
+![PNG to 4-bit TIM, plain vs dithered](assets/04_dither_4bit.png)
+
 ## Supported formats
 
 ### TIM output formats
@@ -114,6 +126,8 @@ python3 src/py/ps1_tim_tool.py --diff --original original.tim --modified edited.
 | `16bit` | Direct RGBA5551   | No   | 1-bit (opaque/transparent) | Textures needing full color range  |
 | `24bit` | Direct RGB888     | No   | None                       | Splash screens, static backgrounds |
 
+![16-bit full color TIM extracted to PNG](assets/02_convert_16bit_fullcolor.png)
+
 ### Input image formats (for conversion)
 
 `.png` `.jpg` `.jpeg` `.bmp` `.tga` `.tiff` `.tif` `.webp` `.gif` `.ppm` `.pgm` `.pbm` `.ico` `.dds`
@@ -121,6 +135,12 @@ python3 src/py/ps1_tim_tool.py --diff --original original.tim --modified edited.
 ### Extraction formats (`--extract`)
 
 `png` `bmp` `tga` `tiff` `webp` `ppm`
+
+## Inspecting and verifying
+
+`--info` prints the header, CLUT and VRAM data, including the ready-to-use `TPAGE` and `CLUT ID`. `--verify` checks that the file's structure is consistent.
+
+![Info and verify output](assets/03_info_verify.png)
 
 ## Command reference
 
@@ -168,6 +188,8 @@ sky.png     16bit
 splash.png  24bit
 ```
 
+![Batch conversion and VRAM placement](assets/06_batch_and_vram.png)
+
 ### Diff list file (`--diff-list`)
 
 One pair per line: the original file followed by the modified file. Blank lines and lines starting with `#` are ignored.
@@ -188,6 +210,8 @@ hero.tim          hero_edit.tim
 | `WARNING` | No blocking issues, but review the warnings (for example a file size change)  |
 | `UNSAFE`  | A blocking difference (such as a format or dimension change) or an unreadable file, so the game may crash or render incorrectly |
 
+![Diff report showing SAFE and UNSAFE verdicts](assets/05_diff.png)
+
 When comparing two folders, a summary with the number of `SAFE`, `WARNING` and `UNSAFE` results is printed at the end.
 
 ## Format notes
@@ -204,6 +228,7 @@ The PS1 GPU is a different chip with a different memory model than the PS2's Gra
 
 ```
 ps1-tim-tool/
+├── assets/                   # screenshots used in this README
 ├── src/
 │   ├── c/ps1_tim_tool.c      # native C implementation
 │   └── py/ps1_tim_tool.py    # Python implementation
