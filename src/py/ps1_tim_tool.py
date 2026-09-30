@@ -366,10 +366,12 @@ def color_from_5551(val: int):
 
 def quantize_best(img_rgba: Image.Image, num_colors: int, use_dither: bool = False):
     """Color reduction with MEDIANCUT and optional Floyd-Steinberg support."""
-    dither_mode = Image.Dither.FLOYDSTEINBERG if use_dither else Image.Dither.NONE
     bg = Image.new('RGB', img_rgba.size, (0, 0, 0))
     bg.paste(img_rgba.convert('RGB'), mask=img_rgba.split()[3])
-    return bg.quantize(colors=num_colors, method=1, dither=dither_mode)
+    q = bg.quantize(colors=num_colors, method=1)
+    if use_dither:
+        q = bg.quantize(colors=num_colors, palette=q, dither=Image.Dither.FLOYDSTEINBERG)
+    return q
 
 
 def extract_alpha_per_index(img_rgba: Image.Image, img_q: Image.Image, num_colors: int) -> dict:
