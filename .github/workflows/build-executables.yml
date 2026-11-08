@@ -199,19 +199,33 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl xz-utils git cmake ninja-build pkg-config
+          sudo apt-get install -y curl xz-utils git cmake ninja-build pkg-config zip unzip tar
 
-      - name: Install LLVM-MinGW
+      - name: Install LLVM-MinGW (latest release)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          LLVM_MINGW_VERSION=20250114
-          curl -L "https://github.com/mstorsjo/llvm-mingw/releases/download/$LLVM_MINGW_VERSION/llvm-mingw-$LLVM_MINGW_VERSION-ucrt-ubuntu-22.04-x86_64.tar.xz" -o llvm-mingw.tar.xz
-          mkdir llvm-mingw
-          tar -xJf llvm-mingw.tar.xz -C llvm-mingw --strip-components=1
+          set -euo pipefail
+          mkdir -p llvm-mingw-dl
+          gh release download --repo mstorsjo/llvm-mingw \
+            --pattern "*-ucrt-ubuntu-*x86_64.tar.xz" --dir llvm-mingw-dl --clobber
+          set -- llvm-mingw-dl/*.tar.xz
+          ARCHIVE="$1"
+          echo "Using toolchain archive: $ARCHIVE"
+          mkdir -p llvm-mingw
+          tar -xJf "$ARCHIVE" -C llvm-mingw --strip-components=1
           LLVM_BIN="$PWD/llvm-mingw/bin"
-          ln -sf armv7-w64-mingw32-clang "$LLVM_BIN/armv7-w64-mingw32-gcc"
-          ln -sf armv7-w64-mingw32-clang++ "$LLVM_BIN/armv7-w64-mingw32-g++"
-          ln -sf llvm-ar "$LLVM_BIN/armv7-w64-mingw32-ar"
-          ln -sf llvm-ranlib "$LLVM_BIN/armv7-w64-mingw32-ranlib"
+          # vcpkg's MinGW toolchain looks for these exact names
+          for tool in gcc g++ ar ranlib; do
+            link="$LLVM_BIN/armv7-w64-mingw32-$tool"
+            if [ ! -e "$link" ]; then
+              case "$tool" in
+                gcc) ln -s armv7-w64-mingw32-clang "$link" ;;
+                g++) ln -s armv7-w64-mingw32-clang++ "$link" ;;
+                *)   ln -s "llvm-$tool" "$link" ;;
+              esac
+            fi
+          done
           echo "$LLVM_BIN" >> "$GITHUB_PATH"
 
       - name: Bootstrap vcpkg
@@ -221,6 +235,7 @@ jobs:
 
       - name: Build ARM32 Windows dependencies
         run: |
+          set -euo pipefail
           export PATH="$PWD/llvm-mingw/bin:$PATH"
           export CC=armv7-w64-mingw32-clang
           export CXX=armv7-w64-mingw32-clang++
@@ -228,13 +243,47 @@ jobs:
 
       - name: Build (windows-arm)
         run: |
+          set -euo pipefail
           mkdir -p dist
           VCPKG_DIR="vcpkg/installed/arm-mingw-dynamic"
-          armv7-w64-mingw32-clang -O3 -flto -std=gnu11 -Wall -Wextra \\
-            -I"$VCPKG_DIR/include" -L"$VCPKG_DIR/lib" \\
-            "$SRC_PATH" \\
-            -lpng -ljpeg -lgif -ltiff -lwebp -lz -lm \\
+          cat > /tmp/win_compat_prelude.h <<'PRELUDE_EOF'
+          #include <sys/stat.h>
+          #include <sys/types.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #define mkdir(path, mode) mkdir(path)
+          static ssize_t compat_getline(char **lineptr, size_t *n, FILE *stream) {
+              if (*lineptr == NULL || *n == 0) {
+                  *n = 128;
+                  *lineptr = (char *)malloc(*n);
+                  if (*lineptr == NULL) return -1;
+              }
+              size_t pos = 0;
+              int c;
+              while ((c = fgetc(stream)) != EOF) {
+                  if (pos + 1 >= *n) {
+                      size_t new_size = (*n) * 2;
+                      char *new_ptr = (char *)realloc(*lineptr, new_size);
+                      if (!new_ptr) return -1;
+                      *n = new_size;
+                      *lineptr = new_ptr;
+                  }
+                  (*lineptr)[pos++] = (char)c;
+                  if (c == '\n') break;
+              }
+              if (pos == 0 && c == EOF) return -1;
+              (*lineptr)[pos] = '\0';
+              return (ssize_t)pos;
+          }
+          #define getline compat_getline
+          PRELUDE_EOF
+          armv7-w64-mingw32-clang -O3 -flto -std=gnu11 -Wall -Wextra \
+            -include /tmp/win_compat_prelude.h \
+            -I"$VCPKG_DIR/include" -L"$VCPKG_DIR/lib" \
+            "$SRC_PATH" \
+            -lpng16 -ljpeg -lgif -ltiff -lwebp -lsharpyuv -lz -lm \
             -o "dist/ps1-tim-tool-windows-arm.exe"
+          file "dist/ps1-tim-tool-windows-arm.exe"
 
       - name: Upload to v1.0.0 release
         env:
@@ -245,26 +294,55 @@ jobs:
 
   build-linux-arm32:
     needs: cleanup
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install ARM32 cross compiler and dependencies
         run: |
+          set -euxo pipefail
           sudo dpkg --add-architecture armhf
+
+          # 1) Keep every existing (amd64) repository amd64-only.
+          #    Ubuntu does not publish armhf on archive.ubuntu.com /
+          #    security.ubuntu.com, so apt would fail there with HTTP 404.
+          for f in /etc/apt/sources.list.d/*.list; do
+            [ -e "$f" ] || continue
+            sudo sed -i -E '/^[[:space:]]*deb[[:space:]]+\[/! s|^deb |deb [arch=amd64] |' "$f"
+          done
+          for f in /etc/apt/sources.list.d/*.sources; do
+            [ -e "$f" ] || continue
+            sudo grep -q '^Architectures:' "$f" && continue
+            sudo sed -i -E 's/^(Types: .*)$/\1\nArchitectures: amd64/' "$f"
+          done
+          if [ -s /etc/apt/sources.list ]; then
+            sudo sed -i -E '/^[[:space:]]*deb[[:space:]]+\[/! s|^deb |deb [arch=amd64] |' /etc/apt/sources.list
+          fi
+
+          # 2) armhf packages only exist on ports.ubuntu.com/ubuntu-ports
+          sudo tee /etc/apt/sources.list.d/ubuntu-ports.sources >/dev/null <<'EOF'
+          Types: deb
+          URIs: http://ports.ubuntu.com/ubuntu-ports/
+          Suites: noble noble-updates noble-backports noble-security
+          Components: main universe restricted multiverse
+          Architectures: armhf
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          EOF
+
           sudo apt-get update
-          sudo apt-get install -y gcc-arm-linux-gnueabihf \\
-            libpng-dev:armhf libjpeg-dev:armhf libgif-dev:armhf \\
+          sudo apt-get install -y gcc-arm-linux-gnueabihf \
+            libpng-dev:armhf libjpeg-dev:armhf libgif-dev:armhf \
             libtiff-dev:armhf libwebp-dev:armhf
 
       - name: Build (linux-arm)
         run: |
           mkdir -p dist
-          arm-linux-gnueabihf-gcc -O3 -flto -std=c11 -Wall -Wextra \\
-            "$SRC_PATH" \\
-            -lpng -ljpeg -lgif -ltiff -lwebp -lz -lm \\
+          arm-linux-gnueabihf-gcc -O3 -flto -std=c11 -Wall -Wextra \
+            "$SRC_PATH" \
+            -lpng -ljpeg -lgif -ltiff -lwebp -lz -lm \
             -o "dist/ps1-tim-tool-linux-arm"
+          file "dist/ps1-tim-tool-linux-arm"
 
       - name: Upload to v1.0.0 release
         env:
@@ -274,7 +352,7 @@ jobs:
 
   build-macos-arm64:
     needs: cleanup
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -287,11 +365,16 @@ jobs:
         run: |
           mkdir -p dist
           BREW_PREFIX=$(brew --prefix)
+          # Homebrew ships the PNG library as libpng16.dylib (plus a libpng.dylib
+          # alias); pick whichever name exists so the link never fails.
+          PNG_FLAG="-lpng"
+          [ -e "$BREW_PREFIX/lib/libpng.dylib" ] || PNG_FLAG="-lpng16"
           gcc -O3 -flto -std=c11 -Wall -Wextra \
             -I"$BREW_PREFIX/include" -L"$BREW_PREFIX/lib" \
             "$SRC_PATH" \
-            -lpng -ljpeg -lgif -ltiff -lwebp -lz -lm \
+            "$PNG_FLAG" -ljpeg -lgif -ltiff -lwebp -lz -lm \
             -o "dist/ps1-tim-tool-macos-arm64"
+          file "dist/ps1-tim-tool-macos-arm64"
 
       - name: Upload to v1.0.0 release
         env:
@@ -301,7 +384,7 @@ jobs:
 
   build-macos-x86_64:
     needs: cleanup
-    runs-on: macos-14
+    runs-on: macos-15-intel
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -324,6 +407,7 @@ jobs:
             "$SRC_PATH" \
             -lpng16 -ljpeg -lgif -ltiff -llzma -lwebp -lsharpyuv -lz -lm \
             -o "dist/ps1-tim-tool-macos-x86_64"
+          file "dist/ps1-tim-tool-macos-x86_64"
 
       - name: Upload to v1.0.0 release
         env:
@@ -396,4 +480,3 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload v1.0.0 "dist/ps1-tim-tool-android-${{ matrix.arch }}" --repo "$GITHUB_REPOSITORY" --clobber
-
