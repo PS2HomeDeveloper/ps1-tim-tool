@@ -1,9 +1,7 @@
 /*
- * ps1_tim_tool.c - self-contained PS1 TIM image converter
- *
- * Reimplementation of ps1_tim_tool.py using libpng, libjpeg, giflib,
- * libtiff and libwebp. BMP/TGA/PNM/ICO/DDS codecs are implemented here.
- * No external converter or child process is used.
+ * ps1_tim_tool.c - native PlayStation 1 TIM command-line utility.
+ * Image decoding, palette generation, TIM encoding, inspection, and
+ * extraction are handled in-process; no external converter is required.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
@@ -1379,7 +1377,7 @@ static void premultiply_alpha(Image *im) {
     size_t np = (size_t)im->w * im->h;
     for (size_t i = 0; i < np; i++) {
         unsigned a = im->rgba[i * 4 + 3];
-        /* Python round() and C round() differ on exact .5 ties.  Integer
+        /* Match the specified nearest-integer quantization at exact .5 ties. Integer
            half-up is deterministic and differs only in rare tie cases. */
         im->rgba[i * 4] = (uint8_t)((im->rgba[i * 4] * a + 127) / 255);
         im->rgba[i * 4 + 1] = (uint8_t)((im->rgba[i * 4 + 1] * a + 127) / 255);
@@ -1575,7 +1573,7 @@ static int build_median_palette(const Image *im, int requested, uint8_t palette[
     for (size_t i = 0; i < np; i++) {
         const uint8_t *p = im->rgba + i * 4;
         unsigned a = p[3];
-        /* Match the Python quantization input: RGB composited over black using
+        /* Quantization input: RGB composited over black using
            source alpha.  With premultiplication enabled this intentionally
            applies alpha once more, as does the reference pipeline. */
         uint8_t r = (uint8_t)((p[0] * a + 127) / 255), g = (uint8_t)((p[1] * a + 127) / 255),
@@ -1664,6 +1662,30 @@ static int build_median_palette(const Image *im, int requested, uint8_t palette[
     return nb;
 }
 
+static int build_indexed_palette(const Image *im, int requested, uint8_t palette[256][3]) {
+    bool has_transparent = false;
+    size_t np = (size_t)im->w * im->h;
+    for (size_t i = 0; i < np; i++) {
+        if (im->rgba[i * 4 + 3] == 0) {
+            has_transparent = true;
+            break;
+        }
+    }
+
+    if (!has_transparent)
+        return build_median_palette(im, requested, palette);
+
+    uint8_t tmp[256][3];
+    int actual = build_median_palette(im, requested > 1 ? requested - 1 : 1, tmp);
+    memset(palette, 0, 256 * 3);
+    for (int i = 0; i < actual && i + 1 < 256; i++) {
+        palette[i + 1][0] = tmp[i][0];
+        palette[i + 1][1] = tmp[i][1];
+        palette[i + 1][2] = tmp[i][2];
+    }
+    return actual + 1;
+}
+
 static int nearest_palette(double r, double g, double b, const uint8_t pal[256][3], int n) {
     int best = 0;
     double bd = 1e100;
@@ -1690,7 +1712,7 @@ static uint8_t *map_palette(const Image *im, const uint8_t pal[256][3], int n, b
         for (size_t i = 0; i < np; i++) {
             const uint8_t *p = im->rgba + i * 4;
             double a = p[3] / 255.0;
-            int k = nearest_palette(p[0] * a, p[1] * a, p[2] * a, pal, n);
+            int k = p[3] == 0 ? 0 : nearest_palette(p[0] * a, p[1] * a, p[2] * a, pal, n);
             idx[i] = (uint8_t)k;
             asum[k] += p[3];
             acount[k]++;
@@ -1710,7 +1732,7 @@ static uint8_t *map_palette(const Image *im, const uint8_t pal[256][3], int n, b
             double r = clampd(p[0] * a + er0[(x + 1) * 3], 0, 255),
                    g = clampd(p[1] * a + er0[(x + 1) * 3 + 1], 0, 255),
                    b = clampd(p[2] * a + er0[(x + 1) * 3 + 2], 0, 255);
-            int k = nearest_palette(r, g, b, pal, n);
+            int k = p[3] == 0 ? 0 : nearest_palette(r, g, b, pal, n);
             idx[(size_t)y * w + x] = (uint8_t)k;
             asum[k] += p[3];
             acount[k]++;
@@ -1732,8 +1754,7 @@ static uint8_t *map_palette(const Image *im, const uint8_t pal[256][3], int n, b
     return idx;
 }
 
-/* Direct 16-bit channel dithering, matching the serpentine diffusion geometry
-   of the Python implementation.  Output channels hold 5-bit values. */
+/* Serpentine Floyd-Steinberg dithering for direct 5-bit channel quantization. */
 static uint8_t *dither_direct_5bit(const Image *im) {
     int w = im->w;
     size_t np = (size_t)w * im->h;
@@ -1781,9 +1802,14 @@ static uint8_t *dither_direct_5bit(const Image *im) {
 static uint16_t pack_5551(int r5, int g5, int b5, int a) {
     if (a <= 0)
         return 0;
+
+    /* PS1 STP is a transparency-control bit, not 8-bit alpha:
+       1..254 = STP set, 255 = opaque/STP clear. */
     uint16_t v =
-        (uint16_t)(((a >= 128) ? 0x8000 : 0) | ((b5 & 31) << 10) | ((g5 & 31) << 5) | (r5 & 31));
-    return v ? v : 1;
+        (uint16_t)(((a < 255) ? 0x8000 : 0) | ((b5 & 31) << 10) | ((g5 & 31) << 5) | (r5 & 31));
+
+    /* 0x0000 is always transparent, so preserve opaque pure black as 0x8000. */
+    return v ? v : 0x8000;
 }
 static uint16_t color_to_5551(int r, int g, int b, int a) {
     if (a <= 0)
@@ -1797,11 +1823,18 @@ static void color_from_5551(uint16_t v, uint8_t out[4]) {
         memset(out, 0, 4);
         return;
     }
-    int r = v & 31, g = (v >> 5) & 31, b = (v >> 10) & 31;
-    out[0] = (uint8_t)((r << 3) | (r >> 2));
-    out[1] = (uint8_t)((g << 3) | (g >> 2));
-    out[2] = (uint8_t)((b << 3) | (b >> 2));
-    out[3] = 255;
+
+    int r5 = v & 31, g5 = (v >> 5) & 31, b5 = (v >> 10) & 31;
+    out[0] = (uint8_t)((r5 << 3) | (r5 >> 2));
+    out[1] = (uint8_t)((g5 << 3) | (g5 >> 2));
+    out[2] = (uint8_t)((b5 << 3) | (b5 >> 2));
+
+    /* STP=1 is normally semitransparent. STP=1 with RGB=0 is the
+       special non-transparent black case documented by Sony. */
+    if (v & 0x8000)
+        out[3] = (r5 == 0 && g5 == 0 && b5 == 0) ? 255 : 128;
+    else
+        out[3] = 255;
 }
 static unsigned compute_tpage(int x, int y, int pmode, int abr) {
     int tp = pmode == 0 ? 0 : pmode == 1 ? 1 : 2;
@@ -1901,7 +1934,7 @@ static bool build_tim(Image *im, int pmode, bool premult, bool dither, int vx, i
     if (pmode == PMODE_4BIT || pmode == PMODE_8BIT) {
         int nc = pmode == 0 ? 16 : 256;
         uint8_t pal[256][3];
-        int actual = build_median_palette(im, nc, pal);
+        int actual = build_indexed_palette(im, nc, pal);
         uint64_t asum[256];
         uint32_t acount[256];
         uint8_t *idx = map_palette(im, pal, actual, dither, asum, acount);
@@ -1921,9 +1954,17 @@ static bool build_tim(Image *im, int pmode, bool premult, bool dither, int vx, i
         buf_u16(&cl, (uint16_t)cy);
         buf_u16(&cl, (uint16_t)nc);
         buf_u16(&cl, (uint16_t)palettes);
+        bool has_transparent = false;
+        for (size_t ti = 0; ti < (size_t)w * h; ti++) {
+            if (im->rgba[ti * 4 + 3] == 0) {
+                has_transparent = true;
+                break;
+            }
+        }
         for (int row = 0; row < palettes; row++)
             for (int i = 0; i < nc; i++) {
-                int a = acount[i] ? (int)llrint((double)asum[i] / acount[i]) : 255;
+                int a = (has_transparent && i == 0 && acount[i]) ? 0
+                        : (acount[i] ? (int)llrint((double)asum[i] / acount[i]) : 255);
                 buf_u16(&cl, color_to_5551(pal[i][0], pal[i][1], pal[i][2], a));
             }
         free(idx);
@@ -2046,10 +2087,18 @@ static bool parse_tim_mem(const uint8_t *d, size_t n, TimInfo *t) {
     return true;
 }
 static int pixel_width(const TimInfo *t) {
-    return t->pmode == 0   ? t->iw * 4
-           : t->pmode == 1 ? t->iw * 2
-           : t->pmode == 2 ? t->iw
-                           : (t->iw * 2) / 3;
+    if (t->pmode == PMODE_4BIT)
+        return t->iw * 4;
+    if (t->pmode == PMODE_8BIT)
+        return t->iw * 2;
+    if (t->pmode == PMODE_16BIT)
+        return t->iw;
+    if (t->pmode == PMODE_24BIT) {
+        if (t->iw % 3)
+            return 0;
+        return (t->iw * 2) / 3;
+    }
+    return 0;
 }
 static const char *pmode_name(int p) {
     static const char *n[] = {"4-bit Indexed (16 colors, CLUT)", "8-bit Indexed (256 colors, CLUT)",
@@ -2069,6 +2118,11 @@ static bool tim_info_file(const char *path) {
         return false;
     }
     int w = pixel_width(&t);
+    if (!w) {
+        set_error("invalid TIM image width for pixel mode %d", t.pmode);
+        free(d);
+        return false;
+    }
     printf("\n----------------------------------------------------\n  File        :  %s\n  File "
            "size   :  %.2f KB  (%zu bytes)\n----------------------------------------------------\n",
            path_base(path), n / 1024.0, n);
@@ -2076,11 +2130,18 @@ static bool tim_info_file(const char *path) {
            "px\n----------------------------------------------------\n",
            pmode_name(t.pmode), w, t.ih);
     warn_dimensions(path_base(path), w, t.ih);
-    if (t.has_clut)
-        printf("  CLUT present:  yes\n  CLUT colors :  %u per palette x %u palette(s) = %u total\n "
-               " CLUT size   :  %u bytes\n  CLUT X/Y    :  (%d, %d)\n  CLUT ID     :  "
-               "0x%04X\n----------------------------------------------------\n",
-               t.cw, t.ch, t.cw * t.ch, t.cw * t.ch * 2, t.cx, t.cy, compute_clut_id(t.cx, t.cy));
+    if (t.has_clut) {
+        unsigned colors_per_palette = t.pmode == PMODE_4BIT ? 16u :
+                                      t.pmode == PMODE_8BIT ? 256u : t.cw;
+        unsigned palettes_per_row = colors_per_palette ? t.cw / colors_per_palette : 0;
+        unsigned palette_total = palettes_per_row * t.ch;
+        printf("  CLUT present:  yes\n  CLUT colors :  %u per palette x %u palette(s) = %u total\n"
+               "  CLUT layout :  %u palette(s) horizontally x %u row(s)\n"
+               "  CLUT size   :  %u bytes\n  CLUT X/Y    :  (%d, %d)\n  CLUT ID     :  0x%04X\n"
+               "----------------------------------------------------\n",
+               colors_per_palette, palette_total, colors_per_palette * palette_total,
+               palettes_per_row, t.ch, t.cw * t.ch * 2, t.cx, t.cy, compute_clut_id(t.cx, t.cy));
+    }
     else
         printf("  CLUT present:  no\n----------------------------------------------------\n");
     printf("  Image data  :  %zu bytes  (declared %u)\n  Image X/Y   :  (%d, %d)\n  TPAGE       :  "
@@ -2093,47 +2154,88 @@ static bool tim_info_file(const char *path) {
 static bool verify_tim_file(const char *path) {
     printf("Verifying: %s ... ", path_base(path));
     fflush(stdout);
+
     uint8_t *d;
     size_t n;
     if (!read_file(path, &d, &n)) {
         printf("FAILED (%s)\n", g_error);
         return false;
     }
+
     TimInfo t;
     if (!parse_tim_mem(d, n, &t)) {
         printf("FAILED (%s)\n", g_error);
         free(d);
         return false;
     }
+
     char problems[4096] = "";
     size_t plen = 0;
 #define PROBLEM(...)                                                                               \
     do {                                                                                           \
         if (plen < sizeof(problems)) {                                                             \
             int z = snprintf(problems + plen, sizeof(problems) - plen, "    - " __VA_ARGS__);      \
-            if (z > 0)                                                                             \
+            if (z > 0)                                                                            \
                 plen += (size_t)z < sizeof(problems) - plen ? (size_t)z : sizeof(problems) - plen; \
         }                                                                                          \
     } while (0)
+
+    uint32_t flag = rd32(d + 4);
+    if (flag & 0xFFFFFFF0u)
+        PROBLEM("Reserved TIM flag bits are set: 0x%08X\n", flag & 0xFFFFFFF0u);
+
+    if (t.pmode > PMODE_24BIT)
+        PROBLEM("Unsupported TIM pixel mode: %d\n", t.pmode);
+
     if (t.parsed_end != n)
         PROBLEM("Trailing data: parsed %zu of %zu bytes\n", t.parsed_end, n);
+
     if (t.has_clut) {
         if (t.clut_len != 12u + (uint32_t)t.cw * t.ch * 2u)
             PROBLEM("Declared CLUT section length does not match dimensions\n");
-        int want = t.pmode == 0 ? 16 : t.pmode == 1 ? 256 : 0;
-        if (want && t.cw != want)
-            PROBLEM("Colors per palette (%u) unexpected (expected %d)\n", t.cw, want);
-    } else if (t.pmode < 2)
+
+        if (!t.cw || !t.ch)
+            PROBLEM("CLUT width/height must be non-zero\n");
+
+        int want = t.pmode == PMODE_4BIT ? 16 : t.pmode == PMODE_8BIT ? 256 : 0;
+        if (want && (t.cw % (unsigned)want) != 0)
+            PROBLEM("CLUT width (%u) must be a multiple of %d colors per palette\n", t.cw, want);
+
+        if (t.pmode >= PMODE_16BIT)
+            PROBLEM("Direct-color TIM must not contain a CLUT\n");
+    } else if (t.pmode < PMODE_16BIT)
         PROBLEM("Indexed format has no CLUT\n");
-    int w = pixel_width(&t), mult = t.pmode == 0 ? 4 : t.pmode == 1 ? 2 : t.pmode == 3 ? 2 : 1;
-    if (w % mult)
-        PROBLEM("Width is incompatible with required alignment (%d)\n", mult);
-    size_t expected = t.pmode == 0   ? (size_t)w * t.ih / 2
-                      : t.pmode == 1 ? (size_t)w * t.ih
-                      : t.pmode == 2 ? (size_t)w * t.ih * 2
-                                     : (size_t)w * t.ih * 3;
-    if (t.pixel_len != expected)
-        PROBLEM("Image data size (%zu) does not match expected (%zu)\n", t.pixel_len, expected);
+
+    if (!t.iw || !t.ih)
+        PROBLEM("Image width/height must be non-zero\n");
+
+    if (t.pmode == PMODE_24BIT && (t.iw % 3u))
+        PROBLEM("24-bit image width field must be a multiple of 3 halfwords\n");
+
+    int w = 0;
+    if (t.pmode == PMODE_24BIT && (t.iw % 3u))
+        w = 0;
+    else
+        w = pixel_width(&t);
+
+    if (w) {
+        int mult = t.pmode == PMODE_4BIT ? 4
+                 : t.pmode == PMODE_8BIT ? 2
+                 : t.pmode == PMODE_24BIT ? 2
+                 : 1;
+
+        if (w % mult)
+            PROBLEM("Width is incompatible with required alignment (%d)\n", mult);
+
+        size_t expected = t.pmode == PMODE_4BIT   ? (size_t)w * t.ih / 2
+                        : t.pmode == PMODE_8BIT   ? (size_t)w * t.ih
+                        : t.pmode == PMODE_16BIT  ? (size_t)w * t.ih * 2
+                                                   : (size_t)w * t.ih * 3;
+
+        if (t.pixel_len != expected)
+            PROBLEM("Image data size (%zu) does not match expected (%zu)\n", t.pixel_len, expected);
+    }
+
 #undef PROBLEM
     bool ok = plen == 0;
     printf(ok ? "OK\n" : "FAILED\n%s", problems);
@@ -2153,18 +2255,24 @@ static Image *decode_tim_image(const TimInfo *t, int palette_index) {
             image_free(im);
             return NULL;
         }
-        if (palette_index < 0 || palette_index >= t->ch) {
-            printf("  NOTE: this file only contains %u palette(s), palette 0 will be used instead "
-                   "of %d\n",
-                   t->ch, palette_index);
+        unsigned colors_per_palette = t->pmode == PMODE_4BIT ? 16u : 256u;
+        unsigned palettes_per_row = t->cw / colors_per_palette;
+        unsigned palette_total = palettes_per_row * t->ch;
+        if (palette_index < 0 || (unsigned)palette_index >= palette_total) {
+            printf("  NOTE: this file contains %u palette(s), palette 0 will be used instead of %d\n",
+                   palette_total, palette_index);
             palette_index = 0;
         }
+        unsigned palette_row = (unsigned)palette_index / palettes_per_row;
+        unsigned palette_column = (unsigned)palette_index % palettes_per_row;
         for (size_t i = 0; i < np; i++) {
             unsigned idx = t->pmode == 0 ? ((i & 1) ? t->pixels[i / 2] >> 4 : t->pixels[i / 2] & 15)
                                          : t->pixels[i];
-            if (idx >= t->cw)
+            if (idx >= colors_per_palette)
                 idx = 0;
-            uint16_t v = rd16(t->colors + ((size_t)palette_index * t->cw + idx) * 2);
+            size_t clut_index = (size_t)palette_row * t->cw +
+                                (size_t)palette_column * colors_per_palette + idx;
+            uint16_t v = rd16(t->colors + clut_index * 2);
             color_from_5551(v, im->rgba + i * 4);
         }
     } else if (t->pmode == 2)
@@ -2214,6 +2322,7 @@ static DiffLevel diff_files(const char *a, const char *b, bool header) {
                "original: %s\n    modified: "
                "%s\n--------------------------------------------------------\n",
                path_base(a), path_base(b));
+
     uint8_t *d1, *d2;
     size_t n1, n2;
     if (!read_file(a, &d1, &n1)) {
@@ -2225,6 +2334,7 @@ static DiffLevel diff_files(const char *a, const char *b, bool header) {
         free(d1);
         return DIFF_UNSAFE;
     }
+
     TimInfo x, y;
     if (!parse_tim_mem(d1, n1, &x)) {
         printf("  UNSAFE - %s\n", g_error);
@@ -2238,23 +2348,57 @@ static DiffLevel diff_files(const char *a, const char *b, bool header) {
         free(d2);
         return DIFF_UNSAFE;
     }
+
     DiffLevel l = DIFF_SAFE;
+
     if (x.pmode != y.pmode) {
         printf("  - Format changed: %s -> %s\n", pmode_name(x.pmode), pmode_name(y.pmode));
         l = DIFF_UNSAFE;
     }
+
     int wx = pixel_width(&x), wy = pixel_width(&y);
     if (wx != wy || x.ih != y.ih) {
         printf("  - Dimensions changed: %dx%u -> %dx%u\n", wx, x.ih, wy, y.ih);
         if (l == DIFF_SAFE)
             l = DIFF_WARNING;
     }
+
     if (x.has_clut != y.has_clut) {
         printf("  - CLUT presence changed\n");
         l = DIFF_UNSAFE;
+    } else if (x.has_clut && y.has_clut) {
+        if (x.cx != y.cx || x.cy != y.cy || x.cw != y.cw || x.ch != y.ch) {
+            printf("  - CLUT metadata changed: (%d,%d) %ux%u -> (%d,%d) %ux%u\n",
+                   x.cx, x.cy, x.cw, x.ch, y.cx, y.cy, y.cw, y.ch);
+            if (l == DIFF_SAFE)
+                l = DIFF_WARNING;
+        }
+
+        size_t c1 = (size_t)x.cw * x.ch * 2;
+        size_t c2 = (size_t)y.cw * y.ch * 2;
+        size_t cm = c1 < c2 ? c1 : c2;
+        if (cm) {
+            size_t dif = 0;
+            for (size_t i = 0; i < cm; i++)
+                dif += x.colors[i] != y.colors[i];
+            double ratio = dif * 100.0 / cm;
+            printf("  - CLUT data difference: %.2f%%\n", ratio);
+        }
+        if (c1 != c2) {
+            printf("  - CLUT data length differs: %zu -> %zu bytes\n", c1, c2);
+            l = DIFF_UNSAFE;
+        }
     }
+
+    if (x.ix != y.ix || x.iy != y.iy || x.iw != y.iw || x.ih != y.ih) {
+        printf("  - Image section metadata changed\n");
+        if (l == DIFF_SAFE)
+            l = DIFF_WARNING;
+    }
+
     if (n1 != n2)
         printf("  - File size differs: %zu bytes -> %zu bytes\n", n1, n2);
+
     size_t m = x.pixel_len < y.pixel_len ? x.pixel_len : y.pixel_len;
     if (m) {
         size_t dif = 0;
@@ -2262,9 +2406,14 @@ static DiffLevel diff_files(const char *a, const char *b, bool header) {
             dif += x.pixels[i] != y.pixels[i];
         double ratio = dif * 100.0 / m;
         printf("  - Pixel data difference: %.2f%%\n", ratio);
-        if (l == DIFF_SAFE && ratio > 30)
+        if (x.pixel_len != y.pixel_len) {
+            printf("  - Pixel data length differs: %zu -> %zu bytes\n",
+                   x.pixel_len, y.pixel_len);
+            l = DIFF_UNSAFE;
+        } else if (l == DIFF_SAFE && ratio > 30)
             l = DIFF_WARNING;
     }
+
     printf("  => %s\n", level_name(l));
     free(d1);
     free(d2);
@@ -2590,22 +2739,78 @@ static char *trim(char *s) {
     return s;
 }
 static bool split_two(char *line, char **a, char **b) {
+    /*
+     * Parse exactly two shell-like fields. Quotes and backslash escapes allow
+     * batch/diff lists to contain paths with spaces, matching Python shlex.
+     */
     char *p = trim(line);
     if (!*p || *p == '#')
         return false;
-    *a = p;
-    while (*p && !isspace((unsigned char)*p))
-        p++;
-    if (!*p) {
-        *b = NULL;
-        return true;
+
+    char *fields[2] = {NULL, NULL};
+    int nf = 0;
+
+    while (*p && nf < 2) {
+        while (isspace((unsigned char)*p))
+            p++;
+        if (!*p || *p == '#')
+            break;
+
+        char *dst = p;
+        char *token = dst;
+        char quote = 0;
+        bool closed = true;
+
+        while (*p) {
+            unsigned char ch = (unsigned char)*p;
+            if (quote) {
+                if (*p == quote) {
+                    quote = 0;
+                    p++;
+                    continue;
+                }
+                if (*p == '\\' && p[1]) {
+                    *dst++ = p[1];
+                    p += 2;
+                    continue;
+                }
+                *dst++ = *p++;
+                continue;
+            }
+
+            if (*p == '"' || *p == '\'') {
+                quote = *p++;
+                continue;
+            }
+            if (isspace(ch))
+                break;
+            if (*p == '\\' && p[1]) {
+                *dst++ = p[1];
+                p += 2;
+                continue;
+            }
+            *dst++ = *p++;
+        }
+
+        if (quote)
+            closed = false;
+        if (!closed)
+            return false;
+
+        *dst = '\0';
+        fields[nf++] = token;
+        while (isspace((unsigned char)*p))
+            p++;
     }
-    *p++ = 0;
-    p = trim(p);
-    *b = p;
-    while (*p && !isspace((unsigned char)*p))
-        p++;
-    *p = 0;
+
+    if (!nf)
+        return false;
+    *a = fields[0];
+    *b = nf >= 2 ? fields[1] : NULL;
+
+    /* More than two fields is an error for both batch and diff lists. */
+    if (*p && *p != '#')
+        return false;
     return true;
 }
 static int run_batch(const Options *o) {

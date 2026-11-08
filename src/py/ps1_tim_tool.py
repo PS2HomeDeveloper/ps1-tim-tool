@@ -1,52 +1,16 @@
 #!/usr/bin/env python3
-"""
-╔══════════════════════════════════════════════════════════════════════╗
-║              PS1 TIM Converter  —  ps1_tim_tool.py                   ║
-║   Convert any image (PNG, JPG, BMP, TGA, WebP …) ← → TIM (.tim)      ║
-║   Supported formats: 4-bit CLUT | 8-bit CLUT | 16-bit Direct | 24-bit Direct ║
-║   Built directly from Sony's official TIM texture spec for PlayStation ║
-╚══════════════════════════════════════════════════════════════════════╝
+"""PlayStation 1 TIM texture converter and inspection utility.
 
-Important technical note before use:
-──────────────────────────────────
-The PS1's TIM texture format is structurally different from TIM2 (PS2):
-  • There is no "32-bit RGBA" because the GPU has no full 8-bit alpha
-    channel — only a single bit per pixel called STP (Semi-Transparency).
-  • The highest direct format available is 24-bit (no transparency at all).
-  • There are no Mipmaps and no GS Swizzle, because the PS1 GPU reads
-    memory linearly — so this tool does not include those two options
-    because they simply don't exist on this hardware (not an oversight).
-  • Power-of-2 dimensions are not mandatory on PS1 the way they are on
-    PS2's GS, but they remained a common convention in older studios,
-    so the tool only warns about it and never enforces it.
-  • There is a special hardware rule: the value 0x0000 (black + STP=0)
-    means a fully transparent pixel regardless of color intent. The
-    tool handles this case automatically (see the color_to_5551
-    function).
+Convert images to the four TIM pixel modes, inspect and verify TIM files,
+extract images, compare assets, and prepare batch conversions.
 
-Usage:
-  {PROG} <image(s)> --format <fmt> [options]
-  {PROG} <file.tim> --info
-  {PROG} <file.tim> --verify
-  {PROG} <file.tim> --extract png
-  {PROG} --list convert.txt
-  {PROG} --diff --original a.tim --modified b.tim
-
-Examples:
-  {PROG} hero.png    --format 16bit
-  {PROG} bg.jpg       --format 24bit
-  {PROG} sprite.bmp   --format 8bit  --dither
-  {PROG} icon.tga     --format 4bit
-  {PROG} *.png *.jpg  --format 16bit
-  {PROG} tex.png      --format 16bit --no-premult
-  {PROG} img.png      --format 8bit  --output out.tim
-  {PROG} font1.tim    --info
-  {PROG} --list textures.txt
-  {PROG} font1.tim    --extract png
-  {PROG}              --list-formats
+TIM supports 4-bit indexed, 8-bit indexed, 16-bit direct, and 24-bit direct
+image data. The 16-bit mode uses the PS1 STP transparency bit.
 """
 
 import argparse
+import math
+import shlex
 import struct
 import sys
 import warnings
@@ -73,10 +37,11 @@ PROG = _prog_name()
 # ══════════════════════════════════════════════════════════════════════════
 #  Accepted input image formats (for conversion to TIM)
 # ══════════════════════════════════════════════════════════════════════════
-SUPPORTED_EXTENSIONS = {
-    '.png', '.jpg', '.jpeg', '.bmp', '.tga', '.tiff', '.tif',
-    '.webp', '.gif', '.ppm', '.pgm', '.pbm', '.ico', '.dds',
-}
+# Use Pillow's registered image decoders rather than maintaining a stale short list.
+# Actual support still depends on the codecs compiled into the installed Pillow.
+_NON_IMAGE_EXTENSIONS = {'.pdf', '.ps', '.eps', '.h5', '.hdf', '.fit', '.fits',
+                         '.bufr', '.grib', '.mpeg', '.mpg', '.flc', '.fli'}
+SUPPORTED_EXTENSIONS = {ext.lower() for ext in Image.registered_extensions()} - _NON_IMAGE_EXTENSIONS
 
 # Supported output formats for --extract (TIM → image)
 EXTRACT_EXTENSIONS = {'.png', '.bmp', '.tga', '.tiff', '.tif', '.webp', '.ppm'}
@@ -172,11 +137,12 @@ def warn_dimensions(name: str, w: int, h: int) -> None:
 
 
 def open_any_image(path: Path) -> Image.Image:
-    ext = path.suffix.lower()
-    if ext not in SUPPORTED_EXTENSIONS:
-        supported = ', '.join(sorted(SUPPORTED_EXTENSIONS))
-        raise ValueError(f"Unsupported file format '{ext}'.\n  Supported: {supported}")
-    return Image.open(path)
+    try:
+        with Image.open(path) as source:
+            source.load()
+            return source.convert('RGBA')
+    except Exception as exc:
+        raise ValueError(f"Cannot decode image '{path}': {exc}") from exc
 
 
 def pad_canvas(img: Image.Image, mult_w: int) -> Image.Image:
@@ -239,7 +205,7 @@ def premultiply_alpha(img: Image.Image) -> Image.Image:
         for x in range(w):
             pr, pg, pb, pa = px[x, y]
             f = pa / 255.0
-            opx[x, y] = (round(pr * f), round(pg * f), round(pb * f), pa)
+            opx[x, y] = ((pr * pa + 127) // 255, (pg * pa + 127) // 255, (pb * pa + 127) // 255, pa)
     return out
 
 
@@ -249,52 +215,34 @@ def premultiply_alpha(img: Image.Image) -> Image.Image:
 
 def pack_5551(r5: int, g5: int, b5: int, a: int) -> int:
     """
-    Packs already-computed 5-bit components (0-31) into the final 16-bit
-    PS1 value, applying the hardware's full-transparency rule (see the
-    color_to_5551 documentation below for details of this rule).
+    Pack 5-bit RGB plus the PS1 STP transparency-control bit.
+
+    PS1 has no 8-bit alpha channel:
+      A=0       -> 0x0000 (transparent)
+      A=1..254  -> STP=1 (semi-transparent)
+      A=255     -> STP=0 (opaque)
+
+    Opaque pure black cannot be 0x0000 because the GPU treats that value
+    as transparent, so it is encoded as 0x8000.
     """
     if a <= 0:
         return 0x0000
-    stp = 1 if a >= 128 else 0
+
+    stp = 1 if a < 255 else 0
     val = (stp << 15) | ((b5 & 0x1F) << 10) | ((g5 & 0x1F) << 5) | (r5 & 0x1F)
+
     if val == 0x0000:
-        val = 0x0001
+        val = 0x8000
     return val
 
 
 def color_to_5551(r: int, g: int, b: int, a: int) -> int:
-    """
-    Converts RGBA8888 → PS1 GPU format (Little Endian, 16-bit):
-    ┌───────────────────────────────────────────────────────────┐
-    │  Bit 15      : STP  (Semi-Transparency enable flag)       │
-    │  Bits 10-14  : B (5 bits)                                 │
-    │  Bits 5-9    : G (5 bits)                                 │
-    │  Bits 0-4    : R (5 bits)                                 │
-    └───────────────────────────────────────────────────────────┘
-    Rounding accuracy: we use round(v * 31 / 255) instead of the raw
-    shift (v >> 3). The difference is decisive: (v >> 3) drops the
-    lowest 3 bits with no rounding at all, so it always truncates every
-    value downward (a systematic quantization bias of up to 7/255 per
-    channel), while round() distributes the error up or down based on
-    the actual nearest value, producing a color that is mathematically
-    closer to the source with roughly half the average error. This is
-    the same approach any professional export tool takes when color
-    accuracy matters.
-
-    Critical hardware rule actually enforced by the GPU:
-      The exact value 0x0000 (all bits zero) = a fully transparent
-      pixel, regardless of color intent. Therefore:
-      • If the requested transparency is 0 → we return 0x0000 directly.
-      • If the computed result is 0x0000 but the color is meant to be
-        opaque (pure opaque black) → we shift the red channel by one
-        bit (0x0001) to avoid it being misread as transparent. This is
-        the same workaround used by professional TIM tools.
-    """
+    """Convert RGBA8888 to PS1 5:5:5:1/STP."""
     if a <= 0:
         return 0x0000
-    r5 = min(31, max(0, round(r * 31 / 255)))
-    g5 = min(31, max(0, round(g * 31 / 255)))
-    b5 = min(31, max(0, round(b * 31 / 255)))
+    r5 = min(31, max(0, (r * 31 + 127) // 255))
+    g5 = min(31, max(0, (g * 31 + 127) // 255))
+    b5 = min(31, max(0, (b * 31 + 127) // 255))
     return pack_5551(r5, g5, b5, a)
 
 
@@ -348,47 +296,256 @@ def warn_vram_bounds(x: int, y: int, w: int, h: int, label: str) -> None:
 
 
 def color_from_5551(val: int):
-    """Reverse conversion: PS1 16-bit value → (r, g, b, a) in the 0-255 range."""
+    """Decode PS1 STP semantics to RGBA for extraction."""
     if val == 0x0000:
         return (0, 0, 0, 0)
+
     r5 = val & 0x1F
     g5 = (val >> 5) & 0x1F
     b5 = (val >> 10) & 0x1F
     r = (r5 << 3) | (r5 >> 2)
     g = (g5 << 3) | (g5 >> 2)
     b = (b5 << 3) | (b5 >> 2)
-    return (r, g, b, 255)
+
+    stp = bool(val & 0x8000)
+    if stp and r5 == 0 and g5 == 0 and b5 == 0:
+        a = 255
+    elif stp:
+        a = 128
+    else:
+        a = 255
+    return (r, g, b, a)
 
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Quantization — color reduction for the indexed formats (4-bit and 8-bit)
 # ══════════════════════════════════════════════════════════════════════════
+#  Quantization — color reduction for the indexed formats (4-bit and 8-bit)
+# ══════════════════════════════════════════════════════════════════════════
 
-def quantize_best(img_rgba: Image.Image, num_colors: int, use_dither: bool = False):
-    """Color reduction with MEDIANCUT and optional Floyd-Steinberg support."""
-    bg = Image.new('RGB', img_rgba.size, (0, 0, 0))
-    bg.paste(img_rgba.convert('RGB'), mask=img_rgba.split()[3])
-    q = bg.quantize(colors=num_colors, method=1)
-    if use_dither:
-        q = bg.quantize(colors=num_colors, palette=q, dither=Image.Dither.FLOYDSTEINBERG)
-    return q
+def build_median_palette(img_rgba: Image.Image, requested: int):
+    """Build the same 5-bit histogram/median-cut palette used by the C tool."""
+    pixels = list(img_rgba.convert('RGBA').getdata())
+    bins = {}
+
+    for r, g, b, a in pixels:
+        rq = (r * a + 127) // 255
+        gq = (g * a + 127) // 255
+        bq = (b * a + 127) // 255
+        key = ((rq >> 3) << 10) | ((gq >> 3) << 5) | (bq >> 3)
+        z = bins.get(key)
+        if z is None:
+            bins[key] = [1, rq, gq, bq]
+        else:
+            z[0] += 1
+            z[1] += rq
+            z[2] += gq
+            z[3] += bq
+
+    colors = []
+    for key in sorted(bins):
+        count, rs, gs, bs = bins[key]
+        colors.append({
+            'count': count,
+            'rsum': rs,
+            'gsum': gs,
+            'bsum': bs,
+            'r5': (key >> 10) & 31,
+            'g5': (key >> 5) & 31,
+            'b5': key & 31,
+        })
+
+    palette = [(0, 0, 0)] * 256
+    if not colors:
+        return palette, 1
+
+    target = min(requested, len(colors))
+    boxes = [{'begin': 0, 'end': len(colors)}]
+
+    def measure(box):
+        subset = colors[box['begin']:box['end']]
+        box['weight'] = sum(c['count'] for c in subset)
+        box['rmin'] = min(c['r5'] for c in subset)
+        box['rmax'] = max(c['r5'] for c in subset)
+        box['gmin'] = min(c['g5'] for c in subset)
+        box['gmax'] = max(c['g5'] for c in subset)
+        box['bmin'] = min(c['b5'] for c in subset)
+        box['bmax'] = max(c['b5'] for c in subset)
+
+    def priority(box):
+        rr = box['rmax'] - box['rmin']
+        gg = box['gmax'] - box['gmin']
+        bb = box['bmax'] - box['bmin']
+        range_ = max(rr, gg, bb)
+        weight = min(box['weight'], 2**31 - 1)
+        return range_ * weight
+
+    measure(boxes[0])
+
+    while len(boxes) < target:
+        pick = -1
+        best = -1
+        for i, box in enumerate(boxes):
+            if box['end'] - box['begin'] > 1:
+                p = priority(box)
+                if p > best:
+                    best = p
+                    pick = i
+        if pick < 0:
+            break
+
+        old = boxes[pick]
+        rr = old['rmax'] - old['rmin']
+        gg = old['gmax'] - old['gmin']
+        bb = old['bmax'] - old['bmin']
+        channel = 0 if rr >= gg and rr >= bb else (1 if gg >= bb else 2)
+
+        colors[old['begin']:old['end']] = sorted(
+            colors[old['begin']:old['end']],
+            key=lambda c: (
+                (c['r5'], c['g5'], c['b5']) if channel == 0 else
+                (c['g5'], c['r5'], c['b5']) if channel == 1 else
+                (c['b5'], c['r5'], c['g5'])
+            )
+        )
+
+        half = (old['weight'] + 1) // 2
+        acc = 0
+        split = old['begin'] + 1
+        for i in range(old['begin'], old['end'] - 1):
+            acc += colors[i]['count']
+            if acc >= half:
+                split = i + 1
+                break
+
+        boxes[pick] = {'begin': old['begin'], 'end': split}
+        new_box = {'begin': split, 'end': old['end']}
+        measure(boxes[pick])
+        measure(new_box)
+        boxes.append(new_box)
+
+    for i, box in enumerate(boxes):
+        subset = colors[box['begin']:box['end']]
+        count = sum(c['count'] for c in subset)
+        if count:
+            rs = sum(c['rsum'] for c in subset)
+            gs = sum(c['gsum'] for c in subset)
+            bs = sum(c['bsum'] for c in subset)
+            palette[i] = (
+                (rs + count // 2) // count,
+                (gs + count // 2) // count,
+                (bs + count // 2) // count,
+            )
+
+    return palette, len(boxes)
 
 
-def extract_alpha_per_index(img_rgba: Image.Image, img_q: Image.Image, num_colors: int) -> dict:
-    """Average real alpha value for each color in the resulting palette."""
-    alpha_data = list(img_rgba.split()[3].getdata())
-    index_data = list(img_q.getdata())
-    grouped: dict = {}
-    for idx, a in zip(index_data, alpha_data):
-        grouped.setdefault(idx, []).append(a)
-    return {i: (round(sum(grouped[i]) / len(grouped[i])) if i in grouped else 255)
-            for i in range(num_colors)}
+def build_indexed_palette(img_rgba: Image.Image, requested: int):
+    """Build an indexed palette while reserving one entry for true transparency.
+
+    A transparent source pixel is represented by 0x0000 on PS1. Keeping a
+    dedicated black/transparent palette entry prevents transparent black
+    from being merged with opaque black during median-cut reduction.
+    """
+    img = img_rgba.convert('RGBA')
+    has_transparent = any(a == 0 for _, _, _, a in img.getdata())
+
+    if not has_transparent:
+        return build_median_palette(img, requested)
+
+    # Reserve palette slot 0 for 0x0000 and quantize the remaining slots.
+    palette, actual = build_median_palette(img, max(1, requested - 1))
+    shifted = [(0, 0, 0)] * 256
+    for i in range(actual):
+        shifted[i + 1] = palette[i]
+    return shifted, actual + 1
+
+
+def nearest_palette(r: float, g: float, b: float, palette, n: int) -> int:
+    best = 0
+    best_distance = float('inf')
+    for i in range(n):
+        pr, pg, pb = palette[i]
+        dr = r - pr
+        dg = g - pg
+        db = b - pb
+        d = dr * dr + dg * dg + db * db
+        if d < best_distance:
+            best_distance = d
+            best = i
+    return best
+
+
+def map_palette(img_rgba: Image.Image, palette, n: int, use_dither: bool):
+    """Map pixels using the same alpha weighting and Floyd-Steinberg pass as C."""
+    img = img_rgba.convert('RGBA')
+    w, h = img.size
+    src = img.load()
+    indices = bytearray(w * h)
+    alpha_sum = [0] * 256
+    alpha_count = [0] * 256
+
+    if not use_dither:
+        for i in range(w * h):
+            r, g, b, a = src[i % w, i // w]
+            af = a / 255.0
+            if a == 0 and n > 0:
+                k = 0
+            else:
+                k = nearest_palette(r * af, g * af, b * af, palette, n)
+            indices[i] = k
+            alpha_sum[k] += a
+            alpha_count[k] += 1
+        return indices, alpha_sum, alpha_count
+
+    err0 = [[0.0, 0.0, 0.0] for _ in range(w + 2)]
+    err1 = [[0.0, 0.0, 0.0] for _ in range(w + 2)]
+
+    for y in range(h):
+        for slot in err1:
+            slot[0] = slot[1] = slot[2] = 0.0
+
+        left_to_right = (y % 2 == 0)
+        xs = range(w) if left_to_right else range(w - 1, -1, -1)
+
+        for x in xs:
+            r, g, b, a = src[x, y]
+            af = a / 255.0
+            r_adj = max(0.0, min(255.0, r * af + err0[x + 1][0]))
+            g_adj = max(0.0, min(255.0, g * af + err0[x + 1][1]))
+            b_adj = max(0.0, min(255.0, b * af + err0[x + 1][2]))
+
+            if a == 0 and n > 0:
+                k = 0
+            else:
+                k = nearest_palette(r_adj, g_adj, b_adj, palette, n)
+            indices[y * w + x] = k
+            alpha_sum[k] += a
+            alpha_count[k] += 1
+
+            errors = (
+                r_adj - palette[k][0],
+                g_adj - palette[k][1],
+                b_adj - palette[k][2],
+            )
+            d = 1 if left_to_right else -1
+            fwd = x + 1 + d
+            back = x + 1 - d
+            for c, e in enumerate(errors):
+                err0[fwd][c] += e * 7 / 16
+                err1[back][c] += e * 3 / 16
+                err1[x + 1][c] += e * 5 / 16
+                err1[fwd][c] += e * 1 / 16
+
+        err0, err1 = err1, err0
+
+    return indices, alpha_sum, alpha_count
 
 
 # ══════════════════════════════════════════════════════════════════════════
 #  Building the CLUT and Image Block — per the official TIM layout
 # ══════════════════════════════════════════════════════════════════════════
-#
+
 #  TIM File Layout:
 #  ┌──────────────────────────────────────────────────────────────┐
 #  │  Offset 0   uint32   ID     = 0x00000010                    │
@@ -402,7 +559,7 @@ def extract_alpha_per_index(img_rgba: Image.Image, img_q: Image.Image, num_color
 #  │    uint16  CLUT Height  (= number of palettes, usually 1)     │
 #  │    ...CLUT colors (each color is a uint16, 5551 format)       │
 #  │  then the image section:                                       │
-#  │    uint32  Image section length (includes this 12-byte        │
+#  │    uint32  Image section length (includes this 12-byte         │
 #  │            sub-header)                                        │
 #  │    int16   Image X                                            │
 #  │    int16   Image Y                                            │
@@ -413,29 +570,23 @@ def extract_alpha_per_index(img_rgba: Image.Image, img_q: Image.Image, num_color
 
 def build_clut_block(colors_5551: list, clut_x: int = 0, clut_y: int = 0,
                      num_palettes: int = 1) -> bytes:
-    """
-    num_palettes > 1 builds several CLUT rows in the same block (the
-    Height field in the TIM header officially allows this) — used in
-    real games to swap colors (recolor) on the same pixel data without
-    duplicating it, e.g. different team colors for the same character.
-    """
+    """Build one or more CLUT rows in the TIM CLUT section."""
     colors_per_palette = len(colors_5551) // num_palettes
     header = struct.pack('<IhhHH', 12 + len(colors_5551) * 2,
-                          clut_x, clut_y, colors_per_palette, num_palettes)
+                         clut_x, clut_y, colors_per_palette, num_palettes)
     body = b''.join(struct.pack('<H', c) for c in colors_5551)
     return header + body
 
 
 def build_image_block(pixel_data: bytes, width_units: int, height: int,
-                      img_x: int = 0, img_y: int = 0) -> bytes:
+                       img_x: int = 0, img_y: int = 0) -> bytes:
     header = struct.pack('<IhhHH', 12 + len(pixel_data), img_x, img_y, width_units, height)
     return header + pixel_data
 
 
 def build_tim_file(pmode: int, clut_block: bytes, image_block: bytes) -> bytes:
     flag = pmode | (CF_CLUT_PRESENT if clut_block else 0)
-    header = struct.pack('<II', TIM_ID, flag)
-    return header + clut_block + image_block
+    return struct.pack('<II', TIM_ID, flag) + clut_block + image_block
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -444,28 +595,26 @@ def build_tim_file(pmode: int, clut_block: bytes, image_block: bytes) -> bytes:
 
 def convert_4bit(img: Image.Image, premult=True, dither=False,
                  vram_x=0, vram_y=0, clut_x=0, clut_y=0, palette_count=1, **_) -> bytes:
-    """
-    4-bit CLUT — up to 16 colors per palette. Ideal for UI, fonts, icons.
-    palette_count > 1: builds several color palettes (16 x N) sharing the
-    same pixel data, to support runtime color swapping (an authentic
-    recolor technique on PS1).
-    """
+    """4-bit CLUT — up to 16 colors per palette."""
     if premult:
         img = premultiply_alpha(img)
     img = img.convert('RGBA')
     img = pad_canvas(img, _WIDTH_MULTIPLE[PMODE_4BIT])
     w, h = img.size
 
-    q = quantize_best(img, 16, use_dither=dither)
-    alpha_map = extract_alpha_per_index(img, q, 16)
-    palette_rgb = q.getpalette()[:16 * 3]
+    palette, actual = build_indexed_palette(img, 16)
+    indices, alpha_sum, alpha_count = map_palette(img, palette, actual, dither)
+
+    has_transparent = any(a == 0 for _, _, _, a in img.getdata())
     base_colors = []
     for i in range(16):
-        r, g, b = palette_rgb[i * 3:i * 3 + 3]
-        base_colors.append(color_to_5551(r, g, b, alpha_map[i]))
+        r, g, b = palette[i]
+        a = 0 if has_transparent and i == 0 and alpha_count[i] else (
+            round(alpha_sum[i] / alpha_count[i]) if alpha_count[i] else 255
+        )
+        base_colors.append(color_to_5551(r, g, b, a))
     colors = base_colors * max(1, palette_count)
 
-    indices = list(q.getdata())
     pixel_data = bytearray(w * h // 2)
     for i in range(0, w * h, 2):
         lo = indices[i] & 0xF
@@ -483,23 +632,27 @@ def convert_4bit(img: Image.Image, premult=True, dither=False,
 
 def convert_8bit(img: Image.Image, premult=True, dither=False,
                  vram_x=0, vram_y=0, clut_x=0, clut_y=0, palette_count=1, **_) -> bytes:
-    """8-bit CLUT — up to 256 colors per palette. Best suited for most game textures."""
+    """8-bit CLUT — up to 256 colors per palette."""
     if premult:
         img = premultiply_alpha(img)
     img = img.convert('RGBA')
     img = pad_canvas(img, _WIDTH_MULTIPLE[PMODE_8BIT])
     w, h = img.size
 
-    q = quantize_best(img, 256, use_dither=dither)
-    alpha_map = extract_alpha_per_index(img, q, 256)
-    palette_rgb = q.getpalette()[:256 * 3]
+    palette, actual = build_indexed_palette(img, 256)
+    indices, alpha_sum, alpha_count = map_palette(img, palette, actual, dither)
+
+    has_transparent = any(a == 0 for _, _, _, a in img.getdata())
     base_colors = []
     for i in range(256):
-        r, g, b = palette_rgb[i * 3:i * 3 + 3]
-        base_colors.append(color_to_5551(r, g, b, alpha_map[i]))
+        r, g, b = palette[i]
+        a = 0 if has_transparent and i == 0 and alpha_count[i] else (
+            round(alpha_sum[i] / alpha_count[i]) if alpha_count[i] else 255
+        )
+        base_colors.append(color_to_5551(r, g, b, a))
     colors = base_colors * max(1, palette_count)
 
-    pixel_data = bytes(q.getdata())
+    pixel_data = bytes(indices)
 
     warn_vram_bounds(clut_x, clut_y, 256, max(1, palette_count), "CLUT")
     warn_vram_bounds(vram_x, vram_y, w // 2, h, "Image")
@@ -511,25 +664,11 @@ def convert_8bit(img: Image.Image, premult=True, dither=False,
 
 
 def dither_direct_5bit(img: Image.Image) -> Image.Image:
-    """
-    Floyd-Steinberg error diffusion (serpentine pass) applied directly to
-    the R/G/B channels before packing them into 5-bit form, dedicated to
-    the direct 16-bit format (it has no CLUT for Pillow to rely on, so
-    packing the channel directly with no error diffusion used to cause
-    visible banding in smooth gradients).
-    Every pixel here is rebuilt already-quantized, so that the final
-    value later passed into color_to_5551 matches exactly what the
-    diffusion chose here (round() on a multiple of 255/31 returns the
-    same index). Transparency (alpha) passes through unmodified — it has
-    no relation to color quality.
-    """
+    """Serpentine Floyd-Steinberg dithering for direct 5-bit RGB channels."""
     img = img.convert('RGBA')
     w, h = img.size
     src = img.load()
 
-    # Floating-point error buffer per channel (current row + next row),
-    # sized w+2 to avoid going out of bounds when diffusing left/right
-    # in the serpentine pass.
     err_r = [[0.0] * (w + 2) for _ in range(2)]
     err_g = [[0.0] * (w + 2) for _ in range(2)]
     err_b = [[0.0] * (w + 2) for _ in range(2)]
@@ -542,24 +681,25 @@ def dither_direct_5bit(img: Image.Image) -> Image.Image:
         cur_r, nxt_r = err_r[y % 2], err_r[(y + 1) % 2]
         cur_g, nxt_g = err_g[y % 2], err_g[(y + 1) % 2]
         cur_b, nxt_b = err_b[y % 2], err_b[(y + 1) % 2]
+
         for i in range(w + 2):
-            nxt_r[i] = 0.0
-            nxt_g[i] = 0.0
-            nxt_b[i] = 0.0
+            nxt_r[i] = nxt_g[i] = nxt_b[i] = 0.0
 
         left_to_right = (y % 2 == 0)
         xs = range(w) if left_to_right else range(w - 1, -1, -1)
+
         for x in xs:
             r, g, b, a = src[x, y]
             r_adj = r + cur_r[x + 1]
             g_adj = g + cur_g[x + 1]
             b_adj = b + cur_b[x + 1]
 
-            r5 = min(31, max(0, round(r_adj / step)))
-            g5 = min(31, max(0, round(g_adj / step)))
-            b5 = min(31, max(0, round(b_adj / step)))
+            # C uses floor(x + 0.5), not Python's bankers-rounding.
+            r5 = max(0, min(31, math.floor(r_adj / step + 0.5)))
+            g5 = max(0, min(31, math.floor(g_adj / step + 0.5)))
+            b5 = max(0, min(31, math.floor(b_adj / step + 0.5)))
 
-            dst[x, y] = (r5, g5, b5, a)  # temporarily store the 5-bit index in the channels
+            dst[x, y] = (r5, g5, b5, a)
 
             er = r_adj - r5 * step
             eg = g_adj - g5 * step
@@ -567,18 +707,24 @@ def dither_direct_5bit(img: Image.Image) -> Image.Image:
 
             d = 1 if left_to_right else -1
             fwd, back = x + 1 + d, x + 1 - d
-            cur_r[fwd] += er * 7 / 16; nxt_r[back] += er * 3 / 16
-            nxt_r[x + 1] += er * 5 / 16; nxt_r[fwd] += er * 1 / 16
-            cur_g[fwd] += eg * 7 / 16; nxt_g[back] += eg * 3 / 16
-            nxt_g[x + 1] += eg * 5 / 16; nxt_g[fwd] += eg * 1 / 16
-            cur_b[fwd] += eb * 7 / 16; nxt_b[back] += eb * 3 / 16
-            nxt_b[x + 1] += eb * 5 / 16; nxt_b[fwd] += eb * 1 / 16
+            cur_r[fwd] += er * 7 / 16
+            nxt_r[back] += er * 3 / 16
+            nxt_r[x + 1] += er * 5 / 16
+            nxt_r[fwd] += er * 1 / 16
+            cur_g[fwd] += eg * 7 / 16
+            nxt_g[back] += eg * 3 / 16
+            nxt_g[x + 1] += eg * 5 / 16
+            nxt_g[fwd] += eg * 1 / 16
+            cur_b[fwd] += eb * 7 / 16
+            nxt_b[back] += eb * 3 / 16
+            nxt_b[x + 1] += eb * 5 / 16
+            nxt_b[fwd] += eb * 1 / 16
 
     return out
 
 
 def convert_16bit(img: Image.Image, premult=True, dither=False, vram_x=0, vram_y=0, **_) -> bytes:
-    """16-bit Direct RGBA5551 — no CLUT, single-bit transparency (opaque/transparent)."""
+    """16-bit Direct RGBA5551 — no CLUT, single-bit transparency."""
     if premult:
         img = premultiply_alpha(img)
     img = img.convert('RGBA')
@@ -586,10 +732,6 @@ def convert_16bit(img: Image.Image, premult=True, dither=False, vram_x=0, vram_y
 
     pixel_data = bytearray()
     if dither:
-        # The image produced by dither_direct_5bit already carries ready
-        # 5-bit indices (0-31) inside its R/G/B channels, so we pack them
-        # directly via pack_5551 without re-quantizing (to avoid applying
-        # round() twice to the same value).
         dimg = dither_direct_5bit(img)
         draw = dimg.tobytes()
         for i in range(0, len(draw), 4):
@@ -608,11 +750,7 @@ def convert_16bit(img: Image.Image, premult=True, dither=False, vram_x=0, vram_y
 
 
 def convert_24bit(img: Image.Image, vram_x=0, vram_y=0, **_) -> bytes:
-    """
-    24-bit Direct RGB888 — no transparency at all (no CLUT and no active
-    STP). Typically used for splash screens and high-quality static
-    backgrounds.
-    """
+    """24-bit Direct RGB888 — no CLUT and no transparency."""
     img = img.convert('RGBA')
     img = pad_canvas(img, _WIDTH_MULTIPLE[PMODE_24BIT])
     w, h = img.size
@@ -632,10 +770,12 @@ def convert_24bit(img: Image.Image, vram_x=0, vram_y=0, **_) -> bytes:
 
 
 CONVERTERS = {
-    '4bit':  convert_4bit,
-    '8bit':  convert_8bit,
+    '4bit': convert_4bit,
+    '8bit': convert_8bit,
     '16bit': convert_16bit,
     '24bit': convert_24bit,
+
+
 }
 
 
@@ -682,6 +822,8 @@ def pixel_width_of(pmode: int, width_units: int) -> int:
     if pmode == PMODE_16BIT:
         return width_units
     if pmode == PMODE_24BIT:
+        if width_units % 3:
+            raise ValueError("Invalid 24-bit TIM width: width field must be a multiple of 3 halfwords")
         return (width_units * 2) // 3
     raise ValueError(f"Unknown pmode: {pmode}")
 
@@ -708,8 +850,12 @@ def tim_info(path: Path) -> None:
     warn_dimensions(path.name, pw, ph)
     if info['clut']:
         c = info['clut']
+        colors_per_palette = 16 if pmode == PMODE_4BIT else 256 if pmode == PMODE_8BIT else c['width']
+        palettes_per_row = c['width'] // colors_per_palette if colors_per_palette else 0
+        palette_total = palettes_per_row * c['height']
         print(f"""  CLUT present:  yes
-  CLUT colors :  {c['width']} per palette   x  {c['height']} palette(s)  =  {c['width']*c['height']} total
+  CLUT colors :  {colors_per_palette} per palette   x  {palette_total} palette(s)  =  {colors_per_palette*palette_total} total
+  CLUT layout :  {palettes_per_row} palette(s) horizontally x {c['height']} row(s)
   CLUT size   :  {len(c['colors']) * 2} bytes
   CLUT X/Y    :  ({c['x']}, {c['y']})
   CLUT ID     :  0x{compute_clut_id(c['x'], c['y']):04X}   [passed directly to the draw command]
@@ -735,41 +881,82 @@ def verify_tim(path: Path) -> bool:
         img = info['image']
 
         problems = []
+
+        if len(data) < 8:
+            problems.append("File is too small for a TIM header")
+        else:
+            _, flag = struct.unpack_from('<II', data, 0)
+            if flag & 0xFFFFFFF0:
+                problems.append(f"Reserved TIM flag bits are set: 0x{flag & 0xFFFFFFF0:08X}")
+            if pmode > PMODE_24BIT:
+                problems.append(f"Unsupported TIM pixel mode: {pmode}")
+
         if img['length'] != 12 + len(img['data']):
             problems.append("Declared image section length does not match the actual data")
+
         if info['clut']:
             c = info['clut']
             if c['length'] != 12 + len(c['colors']) * 2:
                 problems.append("Declared CLUT section length does not match the actual data")
+
+            if c['width'] == 0 or c['height'] == 0:
+                problems.append("CLUT width/height must be non-zero")
+
             expected_colors = 16 if pmode == PMODE_4BIT else 256 if pmode == PMODE_8BIT else None
-            if expected_colors and c['width'] != expected_colors:
-                problems.append(f"Colors per palette ({c['width']}) unexpected for this format "
-                                 f"(expected {expected_colors}) — note: width=colors/palette, "
-                                 f"height=number of palettes")
-        else:
-            if pmode in (PMODE_4BIT, PMODE_8BIT):
-                problems.append("Format is indexed but the file has no CLUT")
+            if expected_colors and c['width'] % expected_colors != 0:
+                problems.append(
+                    f"CLUT width ({c['width']}) must be a multiple of {expected_colors} "
+                    f"colors per palette for this format"
+                )
 
-        pw = pixel_width_of(pmode, img['width_units'])
-        mult = _WIDTH_MULTIPLE[pmode]
-        if pw % mult != 0:
-            problems.append(f"Width is not compatible with the required halfword alignment ({mult})")
+            if pmode >= PMODE_16BIT:
+                problems.append("Direct-color TIM must not contain a CLUT")
+        elif pmode in (PMODE_4BIT, PMODE_8BIT):
+            problems.append("Indexed format has no CLUT")
 
-        expected_data_len = {
-            PMODE_4BIT:  pw * img['height'] // 2,
-            PMODE_8BIT:  pw * img['height'],
-            PMODE_16BIT: pw * img['height'] * 2,
-            PMODE_24BIT: pw * img['height'] * 3,
-        }[pmode]
-        if len(img['data']) != expected_data_len:
-            problems.append(f"Image data size ({len(img['data'])}) does not match the expected "
-                             f"({expected_data_len}) based on the dimensions and format")
+        if img['width_units'] == 0 or img['height'] == 0:
+            problems.append("Image width/height must be non-zero")
+
+        if pmode == PMODE_24BIT and img['width_units'] % 3:
+            problems.append("24-bit image width field must be a multiple of 3 halfwords")
+
+        try:
+            pw = pixel_width_of(pmode, img['width_units'])
+        except ValueError as exc:
+            problems.append(str(exc))
+            pw = 0
+
+        if pw:
+            mult = _WIDTH_MULTIPLE[pmode]
+            if pw % mult != 0:
+                problems.append(
+                    f"Width is not compatible with the required alignment ({mult})"
+                )
+
+            expected_data_len = {
+                PMODE_4BIT: pw * img['height'] // 2,
+                PMODE_8BIT: pw * img['height'],
+                PMODE_16BIT: pw * img['height'] * 2,
+                PMODE_24BIT: pw * img['height'] * 3,
+            }[pmode]
+            if len(img['data']) != expected_data_len:
+                problems.append(
+                    f"Image data size ({len(img['data'])}) does not match the expected "
+                    f"({expected_data_len}) based on the dimensions and format"
+                )
+
+        parsed_end = img['data_offset'] + img['length'] - 12
+        if parsed_end != len(data):
+            problems.append(
+                f"Trailing or missing data: TIM ends at byte {parsed_end}, file size is {len(data)}"
+            )
 
         if problems:
             print("FAILED")
             for p in problems:
                 print(f"    - {p}")
             return False
+
         print("OK")
         return True
     except Exception as e:
@@ -795,13 +982,16 @@ def extract_tim(path: Path, ext: str, palette_index: int = 0) -> Path:
 
     if pmode in (PMODE_4BIT, PMODE_8BIT):
         c = info['clut']
-        n_palettes = c['height']
-        colors_per_pal = c['width']
-        if palette_index >= n_palettes:
-            print(f"  NOTE: this file only contains {n_palettes} palette(s), "
+        colors_per_pal = 16 if pmode == PMODE_4BIT else 256
+        palettes_per_row = c['width'] // colors_per_pal
+        n_palettes = palettes_per_row * c['height']
+        if palette_index < 0 or palette_index >= n_palettes:
+            print(f"  NOTE: this file contains {n_palettes} palette(s), "
                   f"palette 0 will be used instead of {palette_index}")
             palette_index = 0
-        start = palette_index * colors_per_pal
+        row = palette_index // palettes_per_row
+        column = palette_index % palettes_per_row
+        start = row * c['width'] + column * colors_per_pal
         clut_colors = c['colors'][start:start + colors_per_pal]
         palette = [color_from_5551(v) for v in clut_colors]
         if pmode == PMODE_4BIT:
@@ -835,6 +1025,7 @@ def extract_tim(path: Path, ext: str, palette_index: int = 0) -> Path:
 # ══════════════════════════════════════════════════════════════════════════
 
 def diff_files(orig_path: Path, mod_path: Path, show_header: bool = True) -> dict:
+    """Compare TIM structure, metadata, CLUT bytes, and image bytes."""
     sep = '─' * 56
     if show_header:
         print(f"\n{sep}\n  Comparing:\n    original: {orig_path.name}\n    modified: {mod_path.name}\n{sep}")
@@ -864,16 +1055,51 @@ def diff_files(orig_path: Path, mod_path: Path, show_header: bool = True) -> dic
     if bool(i1['clut']) != bool(i2['clut']):
         notes.append("CLUT presence changed between the two files")
         level = 'UNSAFE'
+    elif i1['clut'] and i2['clut']:
+        c1, c2 = i1['clut'], i2['clut']
+        if (c1['x'], c1['y'], c1['width'], c1['height']) != \
+           (c2['x'], c2['y'], c2['width'], c2['height']):
+            notes.append(
+                f"CLUT metadata changed: ({c1['x']},{c1['y']}) "
+                f"{c1['width']}x{c1['height']} → "
+                f"({c2['x']},{c2['y']}) {c2['width']}x{c2['height']}"
+            )
+            if level == 'SAFE':
+                level = 'WARNING'
+        n = min(len(c1['colors']), len(c2['colors']))
+        if n:
+            diffs = sum(a != b for a, b in zip(c1['colors'][:n], c2['colors'][:n]))
+            if len(c1['colors']) != len(c2['colors']):
+                notes.append(
+                    f"CLUT entry count differs: {len(c1['colors'])} → {len(c2['colors'])}"
+                )
+                level = 'UNSAFE'
+            ratio = diffs / n * 100
+            notes.append(f"CLUT data difference: {ratio:.2f}%")
+            if level == 'SAFE' and ratio > 30:
+                level = 'WARNING'
+
+    if (i1['image']['x'], i1['image']['y'],
+        i1['image']['width_units'], i1['image']['height']) != \
+       (i2['image']['x'], i2['image']['y'],
+        i2['image']['width_units'], i2['image']['height']):
+        notes.append("Image section metadata changed")
+        if level == 'SAFE':
+            level = 'WARNING'
 
     if len(d1) != len(d2):
         notes.append(f"File size differs: {len(d1)} bytes → {len(d2)} bytes")
 
-    d_min = min(len(i1['image']['data']), len(i2['image']['data']))
+    p1, p2 = i1['image']['data'], i2['image']['data']
+    d_min = min(len(p1), len(p2))
     if d_min > 0:
-        diffs = sum(1 for a, b in zip(i1['image']['data'][:d_min], i2['image']['data'][:d_min]) if a != b)
+        diffs = sum(a != b for a, b in zip(p1[:d_min], p2[:d_min]))
         ratio = diffs / d_min * 100
         notes.append(f"Pixel data difference: {ratio:.2f}%")
-        if level == 'SAFE' and ratio > 30:
+        if len(p1) != len(p2):
+            notes.append(f"Pixel data length differs: {len(p1)} → {len(p2)} bytes")
+            level = 'UNSAFE'
+        elif level == 'SAFE' and ratio > 30:
             level = 'WARNING'
 
     for n in notes:
@@ -905,9 +1131,14 @@ def read_diff_list(list_path: Path) -> list:
             line = raw.strip()
             if not line or line.startswith('#'):
                 continue
-            parts = line.split()
+            try:
+                parts = shlex.split(line, comments=True, posix=True)
+            except ValueError as exc:
+                raise ValueError(f"Line {lineno}: invalid quoting: {exc}") from exc
             if len(parts) < 2:
                 raise ValueError(f"Line {lineno}: expected '<original> <modified>'")
+            if len(parts) > 2:
+                raise ValueError(f"Line {lineno}: expected exactly two paths")
             pairs.append((Path(parts[0]), Path(parts[1])))
     return pairs
 
@@ -926,9 +1157,14 @@ def read_list_file(list_path: Path) -> list:
             line = raw.strip()
             if not line or line.startswith('#'):
                 continue
-            parts = line.split()
+            try:
+                parts = shlex.split(line, comments=True, posix=True)
+            except ValueError as exc:
+                raise ValueError(f"Line {lineno}: invalid quoting: {exc}") from exc
             if len(parts) < 2:
                 raise ValueError(f"Line {lineno}: missing format. Expected: <filename> <format>")
+            if len(parts) > 2:
+                raise ValueError(f"Line {lineno}: expected '<filename> <format>'")
             filename, fmt = parts[0], parts[1].lower()
             if fmt not in valid:
                 raise ValueError(f"Line {lineno}: unknown format '{fmt}'. Valid: {', '.join(valid)}")

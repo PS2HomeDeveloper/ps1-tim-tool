@@ -138,9 +138,11 @@ Reducing a photo to 16 colors (4-bit) is where dithering matters. Without it the
 
 `png` `bmp` `tga` `tiff` `webp` `ppm`
 
-## Inspecting and verifying
+## Inspecting, verifying and palettes
 
-`--info` prints the header, CLUT and VRAM data, including the ready-to-use `TPAGE` and `CLUT ID`. `--verify` checks that the file's structure is consistent.
+`--info` prints the header, CLUT and VRAM data, including the ready-to-use `TPAGE` and `CLUT ID`. For indexed TIM files, it reports the colors per palette, the total number of palettes, and how the CLUT rectangle is arranged. `--verify` checks the file structure, including whether the CLUT dimensions can be divided into complete palettes for the selected pixel format.
+
+A TIM CLUT can contain more than one palette. In that case, the palettes may be arranged horizontally as well as across multiple CLUT rows. The tool calculates the total palette count from that layout, rather than assuming that the CLUT width always represents exactly one palette. Use `--palette-index` with `--extract` to choose which palette is rendered:
 
 ![Info and verify output](assets/03_info_verify.png)
 
@@ -167,7 +169,7 @@ ps1_tim_tool --diff --diff-list <pairs.txt>
 | `--vram-x`, `--vram-y`   | Image position in VRAM (auto-computes `TPAGE`)                              |
 | `--clut-x`, `--clut-y`   | CLUT position in VRAM (auto-computes `CLUT ID`)                             |
 | `--palette-count`        | Embed multiple CLUT rows for runtime recoloring (4bit/8bit)                 |
-| `--palette-index`        | With `--extract`, choose which palette to render from a multi-palette file  |
+| `--palette-index`        | With `--extract`, choose which palette to render (zero-based index)          |
 | `--info`                 | Print header details of an existing `.tim` file                             |
 | `--verify`               | Validate a `.tim` file's structural integrity                               |
 | `--extract <ext>`        | Convert a `.tim` back to an image (`png`, `bmp`, `tga`, `tiff`, `webp`, `ppm`) |
@@ -223,6 +225,7 @@ The PS1 GPU is a different chip with a different memory model than the PS2's Gra
 - **No 32-bit mode.** The PS1 has no full 8-bit alpha channel, only a single semi-transparency bit (`STP`) per pixel. 24-bit direct color exists but carries no transparency at all.
 - **No mipmaps, no VRAM swizzle.** The PS1 GPU reads texture memory linearly; these concepts are specific to the PS2's GS and don't apply here.
 - **`0x0000` means fully transparent.** This is a real hardware rule, not a bug: a pixel value of exactly zero (black, STP off) is always transparent regardless of intent. The tool detects pixels that would collide with this rule (opaque pure black) and nudges them by one bit so they render correctly.
+- **Indexed CLUTs can contain multiple palettes.** For 4-bit TIM files, each palette contains 16 colors; for 8-bit files, each contains 256. The CLUT can store multiple palettes side by side and/or on multiple rows. `--info`, `--verify`, and `--extract --palette-index` account for that layout.
 - **VRAM placement is manual**, same as on real hardware. `--vram-x/y` and `--clut-x/y` let you set the exact position Sony's own tools exposed, and the tool computes the resulting `TPAGE` and `CLUT ID` for you.
 - **Power-of-2 dimensions are not mandatory** on PS1 (unlike PS2), but the tool still warns when a texture isn't power-of-2, since that convention avoided wasting VRAM in most PS1-era pipelines.
 
