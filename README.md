@@ -43,7 +43,6 @@ Prebuilt executables built from the C version are published on the [Releases](ht
 | Linux | x86_64, x86, arm64 | `ps1_tim_tool_linux_<arch>` |
 | macOS | arm64, x86_64 | `ps1_tim_tool_macos_<arch>` |
 | Android | arm64-v8a, armeabi-v7a, x86, x86_64 | `ps1_tim_tool_android_<arch>` |
-| iOS | arm64, x86_64 (simulator) | `ps1_tim_tool_ios_<arch>` |
 
 On Linux, macOS and Android, make the file executable first:
 
