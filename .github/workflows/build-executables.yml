@@ -7,7 +7,7 @@ permissions:
   contents: write
 
 env:
-  SRC_PATH: src/c/ps1-tim-tool.c
+  SRC_PATH: src/c/ps1_tim_tool.c
 
 jobs:
 
