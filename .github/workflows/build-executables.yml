@@ -52,12 +52,7 @@ jobs:
             msystem: MINGW64
             pkg_prefix: mingw-w64-x86_64
             compiler: gcc
-          - target: windows_x86
-            artifact: windows-x86
-            runner: windows-latest
-            msystem: MINGW32
-            pkg_prefix: mingw-w64-i686
-            compiler: gcc
+
           - target: windows_arm64
             artifact: windows-arm64
             runner: windows-11-arm
@@ -186,6 +181,108 @@ jobs:
         run: |
           gh release upload "${{ needs.cleanup.outputs.release_tag }}" "dist/ps1-tim-tool-${{ matrix.artifact }}" --repo "$GITHUB_REPOSITORY" --clobber
 
+
+
+  build-windows-x86:
+    needs: cleanup
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl xz-utils git cmake ninja-build pkg-config zip unzip tar
+
+      - name: Install LLVM-MinGW (latest release)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p llvm-mingw-dl
+          gh release download --repo mstorsjo/llvm-mingw \
+            --pattern "*-ucrt-ubuntu-*x86_64.tar.xz" --dir llvm-mingw-dl --clobber
+          set -- llvm-mingw-dl/*.tar.xz
+          ARCHIVE="$1"
+          echo "Using toolchain archive: $ARCHIVE"
+          mkdir -p llvm-mingw
+          tar -xJf "$ARCHIVE" -C llvm-mingw --strip-components=1
+          LLVM_BIN="$PWD/llvm-mingw/bin"
+          for tool in gcc g++ ar ranlib; do
+            link="$LLVM_BIN/i686-w64-mingw32-$tool"
+            if [ ! -e "$link" ]; then
+              case "$tool" in
+                gcc) ln -s i686-w64-mingw32-clang "$link" ;;
+                g++) ln -s i686-w64-mingw32-clang++ "$link" ;;
+                *)   ln -s "llvm-$tool" "$link" ;;
+              esac
+            fi
+          done
+          echo "$LLVM_BIN" >> "$GITHUB_PATH"
+
+      - name: Bootstrap vcpkg
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git
+          ./vcpkg/bootstrap-vcpkg.sh
+
+      - name: Build Windows x86 dependencies
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/llvm-mingw/bin:$PATH"
+          export CC=i686-w64-mingw32-clang
+          export CXX=i686-w64-mingw32-clang++
+          ./vcpkg/vcpkg install libpng libjpeg-turbo giflib tiff libwebp --triplet=x86-mingw-dynamic
+
+      - name: Build (windows-x86)
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          VCPKG_DIR="vcpkg/installed/x86-mingw-dynamic"
+          cat > /tmp/win_compat_prelude.h <<'PRELUDE_EOF'
+          #include <sys/stat.h>
+          #include <sys/types.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #define mkdir(path, mode) mkdir(path)
+          static ssize_t compat_getline(char **lineptr, size_t *n, FILE *stream) {
+              if (*lineptr == NULL || *n == 0) {
+                  *n = 128;
+                  *lineptr = (char *)malloc(*n);
+                  if (*lineptr == NULL) return -1;
+              }
+              size_t pos = 0;
+              int c;
+              while ((c = fgetc(stream)) != EOF) {
+                  if (pos + 1 >= *n) {
+                      size_t new_size = (*n) * 2;
+                      char *new_ptr = (char *)realloc(*lineptr, new_size);
+                      if (!new_ptr) return -1;
+                      *n = new_size;
+                      *lineptr = new_ptr;
+                  }
+                  (*lineptr)[pos++] = (char)c;
+                  if (c == '\n') break;
+              }
+              if (pos == 0 && c == EOF) return -1;
+              (*lineptr)[pos] = '\0';
+              return (ssize_t)pos;
+          }
+          #define getline compat_getline
+          PRELUDE_EOF
+          i686-w64-mingw32-clang -O3 -flto -std=gnu11 -Wall -Wextra \
+            -include /tmp/win_compat_prelude.h \
+            -I"$VCPKG_DIR/include" -L"$VCPKG_DIR/lib" \
+            "$SRC_PATH" \
+            -lpng16 -ljpeg -lgif -ltiff -lwebp -lsharpyuv -lz -lm \
+            -o "dist/ps1-tim-tool-windows-x86.exe"
+          file "dist/ps1-tim-tool-windows-x86.exe"
+
+      - name: Upload to latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ needs.cleanup.outputs.release_tag }}" "dist/ps1-tim-tool-windows-x86.exe" --repo "$GITHUB_REPOSITORY" --clobber
 
   build-windows-arm32:
     needs: cleanup
